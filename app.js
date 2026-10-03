@@ -17,6 +17,7 @@ const fmtTs = (ts) => {
 let toastTimer = null;
 function toast(msg, ms) {
   const t = $('#toast');
+  if (!t) return;
   t.textContent = msg;
   t.classList.remove('hidden');
   clearTimeout(toastTimer);
@@ -30,7 +31,7 @@ function mdLite(raw) {
     .replace(/<br\s*\/?>/gi, '\n');
   const lines = norm.split(/\r?\n/);
   let out = '', inOl = false;
-  const closeOl = () => { if (inOl) { out += '</span>'; inOl = false; } };
+  const closeOl = () => { if (inOl) { out += '</div>'; inOl = false; } };
   const bold = (s) => s.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
   for (let rawLn of lines) {
     const ln = bold(esc(rawLn));
@@ -38,7 +39,7 @@ function mdLite(raw) {
     const h = ln.match(/^\s*(#{1,4})\s+(.*)$/);
     if (h) { closeOl(); out += `<span class="md-h${h[1].length}"><b>${h[2]}</b></span><br>`; continue; }
     const ol = ln.match(/^\s*\d+[.、)]\s+(.*)$/);
-    if (ol) { if (!inOl) { out += '<span>'; inOl = true; } out += `<span class="md-oli">${ol[1]}</span>`; continue; }
+    if (ol) { if (!inOl) { out += '<div class="md-ol">'; inOl = true; } out += `<div class="md-oli">${ol[1]}</div>`; continue; }
     closeOl();
     if (/^\s*[-*•·]\s+/.test(ln)) { out += `<span class="md-li">${ln.replace(/^\s*[-*•·]\s+/, '')}</span>`; continue; }
     if (!ln.trim()) { out += '<span class="md-gap"></span>'; continue; }
@@ -58,7 +59,13 @@ function loadLS(key, dft) {
   try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? dft : v; }
   catch (e) { return dft; }
 }
-function saveLS(key, v) { try { localStorage.setItem(key, JSON.stringify(v)); } catch (e) { /* 满：历史截断兜底 */ } }
+function saveLS(key, v) {
+  try { localStorage.setItem(key, JSON.stringify(v)); return true; }
+  catch (e) {
+    if (typeof toast === 'function') toast('本地存储已满：请「我的→导出备份」后清理数据', 4000);
+    return false;
+  }
+}
 
 const State = {
   s: loadLS(LS.state, null) || {
@@ -69,7 +76,7 @@ const State = {
 
 /* ---- 一次性迁移：旧的单聊天记录 → 多会话结构 ---- */
 (function migrateHist() {
-  if (loadLS('ws_sessions', null)) return;
+  if (localStorage.getItem('ws_sessions') !== null) return;   // 键存在（哪怕是 []）就不再迁移
   const old = loadLS('ws_hist', []);
   if (Array.isArray(old) && old.length) {
     const firstQ = old.find(m => m.role === 'user');
@@ -83,19 +90,46 @@ const State = {
 /* ===== 多会话管理 ===== */
 const Sessions = (() => {
   const MAX_SESS = 30;
+  const BUDGET = 3.2 * 1024 * 1024;   // localStorage 预算，超了从最旧会话丢，防静默写失败
+  let _cache = null, _cacheKey = '';
   function all() { return loadLS('ws_sessions', []); }
-  function saveAll(list) { saveLS('ws_sessions', list.slice(0, MAX_SESS)); Sync.markDirty(); }
   function curId() { return State.s.curSession || ''; }
+  function invalidate() { _cache = null; _cacheKey = ''; }
+  function saveAll(list) {
+    let out = list.slice(0, MAX_SESS);
+    const keepId = curId();
+    while (out.length > 1 && JSON.stringify(out).length > BUDGET) {
+      let removed = false;
+      for (let i = out.length - 1; i >= 0; i--) {
+        if (out[i].id !== keepId) { out.splice(i, 1); removed = true; break; }
+      }
+      if (!removed) break;
+    }
+    saveLS('ws_sessions', out);
+    invalidate();
+    Sync.markDirty('hist');
+  }
   function cur() { return all().find(s => s.id === curId()) || null; }
+  /* 带缓存的消息读取：renderMsgs 等高频路径不再每次全量 JSON.parse */
+  function curMsgs() {
+    const id = curId();
+    if (_cache && _cacheKey === id) return _cache;
+    const s = cur();
+    _cache = s ? (s.msgs || []) : [];
+    _cacheKey = id;
+    return _cache;
+  }
   function ensure() {
     let c = cur();
     if (!c) {
       c = { id: uid(), title: '', ts: now(), msgs: [] };
       const list = all();
       list.unshift(c);
-      saveAll(list);
+      _cache = c.msgs; _cacheKey = c.id;
       State.s.curSession = c.id;
       State.save();
+      saveLS('ws_sessions', list.slice(0, MAX_SESS));
+      Sync.markDirty('hist');
     }
     return c;
   }
@@ -109,15 +143,24 @@ const Sessions = (() => {
       const firstQ = msgs.find(m => m.role === 'user');
       if (firstQ) list[i].title = String(firstQ.content).slice(0, 16);
     }
+    _cache = list[i].msgs; _cacheKey = list[i].id;   // 缓存同步为落盘后的数组
     saveAll(list);
   }
-  function switchTo(id) { State.s.curSession = id; State.save(); }
+  function switchTo(id) { State.s.curSession = id; State.save(); invalidate(); }
   function remove(id) {
     saveAll(all().filter(s => s.id !== id));
-    if (curId() === id) { State.s.curSession = ''; State.save(); }
+    if (curId() === id) { State.s.curSession = ''; State.save(); invalidate(); }
   }
-  function newOne() { State.s.curSession = ''; State.save(); }
-  return { all, cur, ensure, put, switchTo, remove, newOne, curId };
+  function newOne() { State.s.curSession = ''; State.save(); invalidate(); }
+  function clearAll() {
+    saveLS('ws_sessions', []);
+    try { localStorage.removeItem('ws_hist'); } catch (e) { /* 旧键清掉，防迁移复活 */ }
+    State.s.curSession = '';
+    State.save();
+    invalidate();
+    Sync.markDirty('hist');
+  }
+  return { all, cur, curMsgs, ensure, put, switchTo, remove, newOne, clearAll, curId, invalidate };
 })();
 
 /* ===== 云端同步（照搬 vocab-flash 模式：裸 fetch + action 协议） ===== */
@@ -175,9 +218,9 @@ const Sync = (() => {
     return (h >>> 0).toString(36);
   }
 
-  function markDirty() {
+  function markDirty(...doms) {
     if (!State.s.syncOn || !State.s.syncCode) return;
-    for (const d of DOMAINS) dirty.add(d);
+    for (const d of (doms.length ? doms : DOMAINS)) dirty.add(d);
     clearTimeout(pushTimer);
     pushTimer = setTimeout(pushAll, PUSH_DELAY);
   }
@@ -224,6 +267,7 @@ const Sync = (() => {
       const local = loadLS('ws_sessions', []);
       if (cloud && Array.isArray(cloud.sessions) && cloud.sessions.length && !local.length) {
         saveLS('ws_sessions', cloud.sessions);
+        Sessions.invalidate();
         State.s.curSession = cloud.cur || cloud.sessions[0].id;
         State.save();
         return true;
@@ -283,6 +327,12 @@ const Sync = (() => {
         let changed = false;
         for (const d of DOMAINS) if (merge(d, j[d])) changed = true;
         if (changed) { Chat.renderMsgs(); KB.render(); }
+        /* 本地非空但云端更新（常见于重装/换设备）→ 不静默丢弃，提示可手动恢复 */
+        if (!changed && j.hist && Array.isArray(j.hist.sessions)) {
+          const cloudMax = j.hist.sessions.reduce((m, s) => Math.max(m, s.ts || 0), 0);
+          const localMax = loadLS('ws_sessions', []).reduce((m, s) => Math.max(m, s.ts || 0), 0);
+          if (cloudMax > localMax + 60000) toast('云端有更新的对话，可在「我的 → 从云端恢复」拉取', 3500);
+        }
         for (const d of DOMAINS) { const h = djb2(JSON.stringify(snapshot(d))); hashes[d] = h; }
         saveLS('ws_sync_hashes', hashes);
         setSyncState('已同步');
@@ -298,14 +348,14 @@ const Sync = (() => {
 /* ===== 记忆档案 ===== */
 const Mem = {
   get() { return loadLS(LS.mem, { profile: '', ts: 0 }); },
-  set(profile) { saveLS(LS.mem, { profile: String(profile || '').slice(0, 800), ts: now() }); Sync.markDirty(); },
+  set(profile) { saveLS(LS.mem, { profile: String(profile || '').slice(0, 800), ts: now() }); Sync.markDirty('mem'); },
 };
 
 /* ===== 进化法则（用户反馈积累的回答教训，每次都注入 AI） ===== */
 const Rules = (() => {
   const MAX = 40;
   function all() { return loadLS(LS.rules, []); }
-  function save(l) { saveLS(LS.rules, l.slice(0, MAX)); Sync.markDirty(); }
+  function save(l) { saveLS(LS.rules, l.slice(0, MAX)); Sync.markDirty('rules'); }
   function texts() { return all().map(r => r.text); }
   function add(text, src) {
     const id = uid();
@@ -335,7 +385,7 @@ const SVG = (() => {
 /* ===== 知识库 ===== */
 const KB = (() => {
   function all() { return loadLS(LS.kb, []); }
-  function save(list) { saveLS(LS.kb, list.slice(0, 500)); Sync.markDirty(); }
+  function save(list) { saveLS(LS.kb, list.slice(0, 500)); }   // 知识库只在本地，不进云同步
 
   /* 关键词打分：标题*3 + 标签*2 + 内容*1 */
   function score(q, e) {
@@ -361,6 +411,7 @@ const KB = (() => {
   function add(entries) {
     if (!Array.isArray(entries) || !entries.length) return 0;
     const list = all();
+    let added = 0;
     for (const it of entries) {
       const title = String(it.title || '').trim().slice(0, 60);
       const content = String(it.content || '').trim().slice(0, 1200);
@@ -370,10 +421,11 @@ const KB = (() => {
         tags: (Array.isArray(it.tags) ? it.tags : []).map(t => String(t).slice(0, 12)).slice(0, 4),
         src: it.src || 'auto', ts: it.ts || now(),
       });
+      added++;
     }
     save(list);
     render();
-    return list.length;
+    return added;   // 实际新增条数（此前返回累计总数，toast 永远为真）
   }
   function remove(id) { save(all().filter(e => e.id !== id)); render(); }
   function clearDoc() { save(all().filter(e => e.src !== 'doc')); render(); }
@@ -465,7 +517,7 @@ const Chat = (() => {
   const HIST_MAX = 120, CTX_MAX = 12;
   const REASONS = ['太浅了', '大俗话', '太理论', '例子不好', '立场偏了', '太长'];
 
-  function hist() { return Sessions.cur() ? (Sessions.cur().msgs || []) : []; }
+  function hist() { return Sessions.curMsgs(); }
   function saveHist(h) { Sessions.put(h, HIST_MAX); }
   function meta() { return loadLS(LS.meta, { rounds: 0 }); }
 
@@ -500,8 +552,9 @@ const Chat = (() => {
       typingState.shown = Math.min(len, typingState.shown + per);
       const b = bubbleEl(idx);
       if (b) b.innerHTML = mdLite(fullText.slice(0, typingState.shown)) + '<span class="caret"></span>';
+      // 只在用户本来就贴着底部时才自动跟随，避免打断上翻历史
       const wrap = $('#chat-msgs');
-      if (wrap) wrap.scrollTop = 1e9;
+      if (wrap && wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 120) wrap.scrollTop = wrap.scrollHeight;
       if (typingState.shown >= len) {
         clearInterval(typingTimer); typingTimer = null;
         typingState = null;
@@ -700,7 +753,7 @@ const Chat = (() => {
       const h = hist();
       h.push({ role: 'assistant', content: full, ts: now() });
       saveHist(h);
-      startTypewriter(h.length - 1, full);   // 打字机式逐段显示
+      startTypewriter(hist().length - 1, full);   // 用落盘（含截断）后的真实下标
       if (State.s.digestOn) digest(q, full).then(n => { if (n) toast('已提炼入库'); });
       // 轮次计数 + 每 20 轮自动复盘
       const mt = meta();
@@ -784,7 +837,7 @@ const Chat = (() => {
       if (okBtn && !okBtn.disabled) {
         const panel = okBtn.closest('.fb-panel');
         const idx = Number(okBtn.getAttribute('data-fb-ok'));
-        const reason = Array.from(panel.querySelectorAll('.chip.on')).map(c => c.getAttribute('data-reason')).join('、');
+        const reason = Array.from(panel.querySelectorAll('.chip.on')).map(c => c.getAttribute('data-reason')).join('、').slice(0, 60);
         const note = (panel.querySelector('.fb-note') || {}).value || '';
         panel.remove();
         feedbackConfirm(idx, reason, note);
@@ -887,7 +940,7 @@ const Me = (() => {
       State.save();
     }
     if (j.mem && j.mem.profile) Mem.set(j.mem.profile);
-    if (Array.isArray(j.rules)) { saveLS(LS.rules, j.rules.map(r => (typeof r === 'string' ? { id: uid(), text: r, src: 'fb', ts: now() } : { ...r, id: r.id || uid() }))); Sync.markDirty(); }
+    if (Array.isArray(j.rules)) { saveLS(LS.rules, j.rules.map(r => (typeof r === 'string' ? { id: uid(), text: r, src: 'fb', ts: now() } : { ...r, id: r.id || uid() }))); Sync.markDirty('rules'); }
     if (j.meta && j.meta.rounds) saveLS(LS.meta, j.meta);
     if (j.settings) {
       if (j.settings.model) { State.s.model = j.settings.model; }
@@ -930,16 +983,22 @@ const Me = (() => {
     try { await Chat.reviewNow(false); } catch (e) { toast('复盘失败：' + e.message); }
   }
 
-  /* 安卓壳自更新：壳内检查远端版本（不走 fetch，避开托管下载策略与 CORS） */
+  /* 安卓壳自更新：壳内检查远端版本（Java 侧后台线程拉取，这里轮询结果，不阻塞） */
   async function checkApkUpdate(manual) {
     const shell = window.wsShell;
     if (!shell || !shell.apkVer) {
       if (manual) toast('网页版永远自动最新，无需更新');
       return;
     }
+    const local = String(shell.apkVer() || '');
     let remote = '';
     try { remote = String(shell.getRemoteApkVer() || ''); } catch (e) { /* 离线 */ }
-    const local = String(shell.apkVer() || '');
+    if (!remote) {
+      for (let i = 0; i < 6 && !remote; i++) {      // 后台线程最多等 ~9s
+        await new Promise(r => setTimeout(r, 1500));
+        try { remote = String(shell.getRemoteApkVer() || ''); } catch (e) { break; }
+      }
+    }
     const bar = $('#apk-update-bar');
     if (remote && local && remote !== local) {
       if (bar) {
@@ -986,8 +1045,8 @@ const Me = (() => {
     $('#modal-code-cancel').addEventListener('click', () => $('#modal-code').classList.add('hidden'));
     $('#modal-code-ok').addEventListener('click', async () => {
       const code = $('#modal-code-input').value.trim().toUpperCase();
+      let old = State.s.syncCode;
       try {
-        const old = State.s.syncCode;
         State.s.syncCode = code;    // 临时用目标码请求
         const n = await Sync.restore(code);
         toast(n ? '恢复完成' : '云端没有数据');
@@ -998,13 +1057,14 @@ const Me = (() => {
         toast('恢复失败：' + e.message);
       }
     });
-    $('#me-model').addEventListener('change', (ev) => { State.s.model = ev.target.value; State.save(); Sync.markDirty(); });
+    $('#me-model').addEventListener('change', (ev) => { State.s.model = ev.target.value; State.save(); Sync.markDirty('settings'); });
     $('#me-models-refresh').addEventListener('click', () => refreshModels(false));
-    $('#me-digest-on').addEventListener('change', (ev) => { State.s.digestOn = ev.target.checked; State.save(); Sync.markDirty(); });
-    $('#me-kb-on').addEventListener('change', (ev) => { State.s.kbOn = ev.target.checked; State.save(); Sync.markDirty(); });
+    $('#me-digest-on').addEventListener('change', (ev) => { State.s.digestOn = ev.target.checked; State.save(); Sync.markDirty('settings'); });
+    $('#me-kb-on').addEventListener('change', (ev) => { State.s.kbOn = ev.target.checked; State.save(); Sync.markDirty('settings'); });
     $('#me-hist-clear').addEventListener('click', () => {
       if (!confirm('清空全部对话记录？此操作不可撤销（云端备份也会在下次同步时覆盖）')) return;
-      saveLS(LS.hist, []); Sync.markDirty(); Chat.renderMsgs(); fillSettings(); toast('已清空');
+      Sessions.clearAll();
+      Chat.renderMsgs(); fillSettings(); toast('已清空');
     });
     $('#rules-list').addEventListener('click', (ev) => {
       const del = ev.target.closest('[data-rule-del]');
@@ -1057,6 +1117,7 @@ const SessPanel = (() => {
       const del = ev.target.closest('[data-sess-del]');
       if (del) {
         ev.stopPropagation();
+        if (!confirm('删除该对话？不可恢复')) return;
         Sessions.remove(del.getAttribute('data-sess-del'));
         render();
         Chat.renderMsgs();
@@ -1107,7 +1168,7 @@ async function boot() {
   Sync.init();
   Me.refreshModels(true);
   if (!loadLS(LS.models, []).length) setTimeout(() => Me.refreshModels(true), 4000);
-  Me.checkApkUpdate();
+  setTimeout(() => Me.checkApkUpdate(), 3000);   // 启动后再查版本，避免抢首屏
 
   /* 版本显示 + 更新弹窗（网页版有新版时醒目提醒一次；壳环境用壳版本号） */
   try {
