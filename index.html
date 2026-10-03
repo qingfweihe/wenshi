@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#ff6b9d">
+<title>问史 · 中国历史政治经济问答</title>
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./icons/icon-192.png">
+<link rel="apple-touch-icon" href="./icons/icon-180.png">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<!-- ===== 顶栏 ===== -->
+<header id="topbar">
+  <div class="brand"><span class="brand-mark">问</span><span class="brand-name">问史</span></div>
+  <div class="brand-sub" id="brand-sub">历史 · 政治 · 经济</div>
+  <div class="top-actions">
+    <button class="icon-btn" id="btn-newchat" aria-label="开启新对话"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+    <button class="icon-btn" id="btn-sessions" aria-label="历史对话"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></button>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ===== 问答页 ===== -->
+  <section class="view" id="view-chat">
+    <div class="chat-wrap">
+      <div id="chat-msgs" class="chat-msgs">
+        <div class="chat-empty" id="chat-empty">
+          <div class="ce-mark">问</div>
+          <div class="ce-title">你好，我是问史</div>
+          <div class="ce-desc">中国历史 · 政治 · 经济，想到什么问什么。<br>我会记住我们聊过的内容，越用越懂你。</div>
+        </div>
+      </div>
+      <div class="ai-chips" id="chat-chips">
+        <button class="chip" data-q="用大白话讲讲什么是「封建制度」，秦朝之后的中国还是封建社会吗？">封建制度是怎么回事？</button>
+        <button class="chip" data-q="为什么说中国是「发展中国家」？和发达国家差在哪？">中国为什么是发展中国家？</button>
+        <button class="chip" data-q="从古代丝绸之路讲到今天的「一带一路」，中国对外贸易的思路变过吗？">丝绸之路与一带一路</button>
+        <button class="chip" data-q="土地改革、家庭联产承包责任制到现在的土地流转，中国农村土地制度是怎么走过来的？">农村土地制度变迁</button>
+        <button class="chip" data-q="科举制度和今天的高考，哪个更能改变普通人的命运？">科举与高考</button>
+      </div>
+      <div class="input-bar">
+        <textarea id="chat-input" rows="1" maxlength="2000" placeholder="问个问题…"></textarea>
+        <button id="chat-send" class="send-btn" aria-label="发送">↑</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 知识库页 ===== -->
+  <section class="view hidden" id="view-kb">
+    <div class="kb-head">
+      <input id="kb-search" type="search" placeholder="搜索知识库…" maxlength="60">
+      <button id="kb-import-btn" class="kb-import">导入文档</button>
+      <input id="kb-file" type="file" accept=".txt,.md,.markdown,text/plain" hidden>
+    </div>
+    <div class="kb-stat" id="kb-stat">共 0 条知识点</div>
+    <div id="kb-list" class="kb-list">
+      <div class="kb-empty">还没有知识点<br><span>每轮问答会自动提炼入库，也可以导入 txt/md 文档</span></div>
+    </div>
+  </section>
+
+  <!-- ===== 我的页 ===== -->
+  <section class="view hidden" id="view-me">
+    <div class="card">
+      <div class="card-title"><svg class="ci" viewBox="0 0 24 24"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>云端备份</div>
+      <div class="row">
+        <div class="row-label">同步码</div>
+        <div class="row-val mono" id="me-code">未生成</div>
+        <button id="me-code-copy" class="mini-btn">复制</button>
+      </div>
+      <div class="row">
+        <div class="row-label">自动备份</div>
+        <div class="row-val"><label class="switch"><input type="checkbox" id="me-sync-on" checked><span></span></label></div>
+      </div>
+      <div class="row">
+        <div class="row-label">状态</div>
+        <div class="row-val" id="me-sync-state">—</div>
+      </div>
+      <div class="btn-row">
+        <button id="me-backup" class="mini-btn wide">立即备份</button>
+        <button id="me-restore" class="mini-btn wide">从云端恢复</button>
+      </div>
+      <div class="tip">换手机时：新手机装好 App → 我的 → 输入（或粘贴）同步码 → 从云端恢复。</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><svg class="ci" viewBox="0 0 24 24"><path d="M8 3v4a4 4 0 0 0 4 4 4 4 0 0 1 4 4v4"/><path d="M16 3v4a4 4 0 0 1-4 4 4 4 0 0 0-4 4v4"/><line x1="7" y1="7" x2="11" y2="7"/><line x1="13" y1="17" x2="17" y2="17"/></svg>进化法则 <span class="card-sub" id="rules-count">0 条</span>
+        <button id="me-review" class="mini-btn" style="float:right">立即复盘</button>
+      </div>
+      <div id="rules-list"></div>
+      <div class="tip">给回答点「没用」会自动生成法则；AI 每次回答都带着全部法则。每 20 轮自动复盘一次。</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><svg class="ci" viewBox="0 0 24 24"><rect x="4" y="8" width="16" height="12" rx="2"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/></svg>AI 设置</div>
+      <div class="row">
+        <div class="row-label">模型</div>
+        <div class="row-val">
+          <select id="me-model"></select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-label">刷新模型</div>
+        <div class="row-val"><button id="me-models-refresh" class="mini-btn">拉取最新列表</button></div>
+      </div>
+      <div class="row">
+        <div class="row-label">问答提炼入库</div>
+        <div class="row-val"><label class="switch"><input type="checkbox" id="me-digest-on" checked><span></span></label></div>
+      </div>
+      <div class="row">
+        <div class="row-label">知识库辅助</div>
+        <div class="row-val"><label class="switch"><input type="checkbox" id="me-kb-on" checked><span></span></label></div>
+      </div>
+      <div class="tip">flash 快而便宜，pro 更聪明但慢；提炼入库会让 AI 记住每轮问答的要点。</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><svg class="ci" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/></svg>数据</div>
+      <div class="row">
+        <div class="row-label">对话记录</div>
+        <div class="row-val" id="me-hist-count">0 条</div>
+        <button id="me-hist-clear" class="mini-btn danger">清空</button>
+      </div>
+      <div class="row">
+        <div class="row-label">导出备份</div>
+        <div class="row-val"><button id="me-export" class="mini-btn">导出到文件</button></div>
+      </div>
+      <div class="row">
+        <div class="row-label">导入备份</div>
+        <div class="row-val"><button id="me-import" class="mini-btn">从文件导入</button></div>
+        <input id="me-import-file" type="file" accept=".json" hidden>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><svg class="ci" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>关于</div>
+      <div class="row"><div class="row-label">运行环境</div><div class="row-val" id="env-line">—</div></div>
+      <div class="row"><div class="row-label">版本</div><div class="row-val" id="ver-line">—</div></div>
+      <div class="row"><div class="row-label">检查更新</div><div class="row-val"><button id="me-checkupd" class="mini-btn">检查更新</button></div></div>
+      <div class="row"><div class="row-label">安卓安装包</div><div class="row-val"><a href="./android/wenshi.apk" download style="color:var(--pink-deep);font-size:13px;text-decoration:none">下载 APK</a></div></div>
+      <div class="tip">问史 · 个人学习工具。数据存在你自己的手机和你的云端备份里。</div>
+    </div>
+  </section>
+
+</main>
+
+<!-- 回到底部悬浮钮 -->
+<button id="to-bottom" class="to-bottom hidden" aria-label="回到底部"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></button>
+
+<!-- 安卓壳更新提示条 -->
+<div id="apk-update-bar" class="apk-bar hidden"></div>
+
+<!-- ===== 底部导航 ===== -->
+<nav id="tabbar">
+  <button class="tab active" data-nav="chat"><span class="tab-ico"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span><span class="tab-name">问答</span></button>
+  <button class="tab" data-nav="kb"><span class="tab-ico"><svg viewBox="0 0 24 24"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></span><span class="tab-name">知识库</span></button>
+  <button class="tab" data-nav="me"><span class="tab-ico"><svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span><span class="tab-name">我的</span></button>
+</nav>
+
+<!-- 恢复同步码弹窗 -->
+<div class="modal hidden" id="modal-code">
+  <div class="modal-box">
+    <div class="modal-title">输入同步码恢复数据</div>
+    <input id="modal-code-input" class="mono" maxlength="12" placeholder="12 位同步码" autocapitalize="characters">
+    <div class="btn-row">
+      <button id="modal-code-cancel" class="mini-btn wide">取消</button>
+      <button id="modal-code-ok" class="mini-btn wide primary">恢复</button>
+    </div>
+  </div>
+</div>
+
+<!-- 版本更新提醒弹窗 -->
+<div class="modal hidden" id="modal-ver">
+  <div class="modal-box">
+    <div class="modal-title">问史已更新</div>
+    <div class="ver-body" id="modal-ver-text">—</div>
+    <div class="btn-row">
+      <button id="modal-ver-ok" class="mini-btn wide primary">知道了</button>
+    </div>
+  </div>
+</div>
+
+<!-- 历史对话面板 -->
+<div class="modal hidden" id="modal-sess">
+  <div class="modal-box sess-box">
+    <div class="modal-title">历史对话 <span class="card-sub" id="sess-count"></span></div>
+    <div id="sess-list" class="sess-list"></div>
+    <div class="btn-row">
+      <button id="sess-new" class="mini-btn wide primary">开启新对话</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="./app.js"></script>
+</body>
+</html>
