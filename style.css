@@ -16,15 +16,32 @@
 }
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100%; }
+/* 字体栈：先中文（各平台系统字体）→ 再 emoji/生僻字回退 → 最后通用。
+   缺 emoji 字体时 emoji 会渲染成 ? 或豆腐块，故必须显式声明。
+   Android 上 PingFang/HarmonyOS/YaHei 均不存在，靠 Noto Sans CJK 兜底。 */
 body {
-  font-family: -apple-system, "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont,
+    "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Source Han Sans SC", "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei",
+    "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Android Emoji", "EmojiSymbols",
+    "Segoe UI Symbol", "Noto Sans Symbols 2",
+    sans-serif;
   background: var(--page-bg);
   color: var(--ink);
   display: flex; flex-direction: column;
   max-width: 720px; margin: 0 auto;
 }
 .hidden { display: none !important; }
-.mono { font-family: "SF Mono", Consolas, monospace; letter-spacing: 1px; }
+/* 等宽字体：SF Mono/Consolas/monospace 都不含汉字，中文注释必须回退到中文字体，
+   否则代码片段里的中文会变问号。 */
+.mono {
+  font-family:
+    "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", Menlo, monospace,
+    "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans Mono CJK SC", "Noto Sans CJK SC", "Microsoft YaHei",
+    "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji",
+    sans-serif;
+  letter-spacing: 1px;
+}
 
 /* ===== 顶栏 ===== */
 #topbar {
@@ -77,7 +94,10 @@ body {
 .msg.user { justify-content: flex-end; }
 .bubble {
   max-width: 84%; padding: 10px 14px; border-radius: 16px;
-  font-size: 15px; line-height: 1.75; word-break: break-word;
+  font-size: 15px; line-height: 1.75;
+  /* overflow-wrap:anywhere 兼容现代内核；word-break:break-word 为旧 WebView 回退。
+     两者并存可避免长串 emoji/URL 被逐字截断成问号。 */
+  overflow-wrap: anywhere; word-break: break-word;
 }
 .msg.user .bubble {
   background: linear-gradient(135deg, var(--pink) 0%, var(--pink-deep) 100%);
@@ -94,6 +114,14 @@ body {
 .bubble .md-li::before { content: "·"; position: absolute; left: 0.3em; color: var(--pink); font-weight: 700; }
 .bubble .md-ol { display: block; margin: 4px 0; }
 .bubble .md-oli { display: block; padding-left: 1.5em; text-indent: -1.2em; }
+/* mdLite 会输出 md-h1~h4，此前无对应样式导致标题无视觉层级 */
+.bubble .md-h1, .bubble .md-h2, .bubble .md-h3, .bubble .md-h4 {
+  display: block; font-weight: 700; color: var(--ink); line-height: 1.6; margin-top: 2px;
+}
+.bubble .md-h1 { font-size: 1.12em; }
+.bubble .md-h2 { font-size: 1.08em; }
+.bubble .md-h3 { font-size: 1.04em; }
+.bubble .md-h4 { font-size: 1em; }
 .bubble b { color: var(--pink-deep); }
 .msg .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
 .msg .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--pink); opacity: .4; animation: blink 1s infinite; }
