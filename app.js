@@ -249,7 +249,7 @@ const Sync = (() => {
   function setSyncState(txt) { lastState = txt; const el = $('#me-sync-state'); if (el) el.textContent = txt; }
 
   /* 合并：知识库按 id 并集（同 id 取新），历史按 ts 去重排序，记忆取新，设置只取偏好 */
-  function merge(domain, cloud) {
+  function merge(domain, cloud, force) {
     if (cloud == null) return false;
     if (domain === 'kb') {
       const local = loadLS(LS.kb, []);
@@ -263,16 +263,42 @@ const Sync = (() => {
       return true;
     }
     if (domain === 'hist') {
-      // 会话列表：本地为空且云端有 → 整体采用云端（个人单设备，简单可靠）
+      /* 兼容两种云端格式：
+         v1 = 平铺消息数组（早期版本写的）；v2 = { sessions:[...], cur } */
+      let cloudSessions = null;
+      if (cloud && Array.isArray(cloud.sessions)) cloudSessions = cloud.sessions;
+      else if (Array.isArray(cloud)) {
+        const firstQ = cloud.find(m => m.role === 'user');
+        const ts = cloud.reduce((m, x) => Math.max(m, x.ts || 0), 0);
+        cloudSessions = [{
+          id: 'legacy-' + ts,
+          title: String((firstQ && firstQ.content) || '历史对话').slice(0, 16),
+          ts, msgs: cloud,
+        }];
+      }
+      if (!cloudSessions || !cloudSessions.length) return false;
       const local = loadLS('ws_sessions', []);
-      if (cloud && Array.isArray(cloud.sessions) && cloud.sessions.length && !local.length) {
-        saveLS('ws_sessions', cloud.sessions);
+      if (!local.length) {
+        saveLS('ws_sessions', cloudSessions);
         Sessions.invalidate();
-        State.s.curSession = cloud.cur || cloud.sessions[0].id;
+        State.s.curSession = (cloud && cloud.cur) || cloudSessions[0].id;
         State.save();
         return true;
       }
-      return false;
+      if (force) {
+        // 手动「从云端恢复」：并集合并（同 id 取新），本地会话保留不丢
+        const map = new Map(local.map(s => [s.id, s]));
+        for (const s of cloudSessions) {
+          const old = map.get(s.id);
+          if (!old || (s.ts || 0) > (old.ts || 0)) map.set(s.id, s);
+        }
+        const merged = Array.from(map.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 30);
+        saveLS('ws_sessions', merged);
+        Sessions.invalidate();
+        if (!State.s.curSession) { State.s.curSession = (merged[0] && merged[0].id) || ''; State.save(); }
+        return true;
+      }
+      return false;   // 自动同步路径：本地有数据就不动（防覆盖）
     }
     if (domain === 'mem') {
       const local = loadLS(LS.mem, { profile: '', ts: 0 });
@@ -281,7 +307,14 @@ const Sync = (() => {
     }
     if (domain === 'rules') {
       const local = loadLS(LS.rules, []);
-      if (!local.length && Array.isArray(cloud) && cloud.length) { saveLS(LS.rules, cloud); return true; }
+      const cloudArr = Array.isArray(cloud) ? cloud : [];
+      if (!local.length && cloudArr.length) { saveLS(LS.rules, cloudArr); return true; }
+      if (force && cloudArr.length) {
+        const seen = new Set(local.map(r => r && r.text));
+        const merged = local.concat(cloudArr.filter(r => r && r.text && !seen.has(r.text)));
+        saveLS(LS.rules, merged.slice(0, 40));
+        return true;
+      }
       return false;
     }
     if (domain === 'settings') {
@@ -299,7 +332,7 @@ const Sync = (() => {
     if (!/^[A-Z2-7]{12}$/.test(target)) throw new Error('同步码格式不对（12 位）');
     const j = await request('state.get', { domain: 'ALL', code: target });
     let n = 0;
-    for (const d of DOMAINS) if (merge(d, j[d])) n++;
+    for (const d of DOMAINS) if (merge(d, j[d], true)) n++;   // 手动恢复：强制合并
     return n;
   }
 
