@@ -1526,16 +1526,29 @@ const Me = (() => {
     $('#me-restore').addEventListener('click', () => openCodeModal());
     $('#modal-code-cancel').addEventListener('click', () => $('#modal-code').classList.add('hidden'));
     $('#modal-code-ok').addEventListener('click', async () => {
-      const code = $('#modal-code-input').value.trim().toUpperCase();
-      let old = State.s.syncCode;
+      const want = $('#modal-code-input').value.trim().toUpperCase();
+      const mine = State.s.syncCode;    // 本机当前身份。恢复过程绝不动它
       try {
-        State.s.syncCode = code;    // 临时用目标码请求
-        const n = await Sync.restore(code);
-        toast(n ? '恢复完成' : '云端没有数据');
+        /* restore() 用的是参数里的码，不依赖 State.s.syncCode，所以这里无需先改身份 */
+        const n = await Sync.restore(want);
+        if (!n) {
+          toast('这个同步码下没有可恢复的数据（空账户或同步码不存在）', 4500);
+          return;
+        }
+        /* 本机已有身份就保持不变，只把数据并进来。
+           此前是直接把身份换成被恢复的码 —— 后果是「先设口令 → 后恢复」会让口令保护
+           名存实亡：界面仍显示「已启用口令」，可码已经不是口令派生的了。 */
+        if (!mine) State.s.syncCode = want;   // 只剩「本机还没拿到码」这一种情况才接管
+        State.save();                          // 立即落盘，避免被中途杀掉后回退，恢复白做
+        /* 关键一步：把并集回写云端，让本地与云端收敛 ——
+           这样旧数据才会真正进到本机（含口令派生的）同步码里。 */
+        const okp = await Sync.pushAll(true);
+        toast(okp
+          ? ('恢复完成，共取回 ' + n + ' 类数据；同步码保持 ' + State.s.syncCode)
+          : '恢复完成，但回写云端失败：请联网后点「立即备份」', 5500);
         $('#modal-code').classList.add('hidden');
         renderCode(); fillSettings(); Chat.renderMsgs(); KB.render();
       } catch (e) {
-        State.s.syncCode = old;
         toast('恢复失败：' + e.message);
       }
     });
