@@ -14,6 +14,45 @@ const fmtTs = (ts) => {
   const p = (n) => (n < 10 ? '0' + n : '' + n);
   return `${d.getMonth() + 1}月${d.getDate()}日 ${p(d.getHours())}:${p(d.getMinutes())}`;
 };
+
+/* 会话标题：原先直接截首问前 16 字，经常断在句子中间
+   （"一句话回答：中华人民共和国哪年成"、"详细讲讲唐朝从安史之乱到灭亡的历史脉络"）。
+   这里先剥掉口头语前缀，再优先在自然停顿处断开，读起来才像个"话题"。
+   标题栏本身还有省略号兜底，所以长度略超不会溢出。 */
+const TITLE_PREFIX = /^(一句话回答|一句话|用大白话讲一讲|用大白话讲讲|用大白话讲|大白话讲|详细讲讲|详细说说|详细讲|简单讲讲|简单说说|简单讲|讲一讲|讲一下|说说|说一下|我想知道|想请教|想问问|请问|问一下|帮我|麻烦|你觉得|你认为|大家觉得|如何看待|怎么看待)[，,：:、\s]*/;
+function cleanTitle(raw) {
+  const src = String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim();
+  if (!src) return '';
+  let s = src.replace(TITLE_PREFIX, '').trim();
+  if (!s) s = src;                                  // 全被剥光就退回原文
+  /* 1) 有句末标点且位置合适 → 就断在那 */
+  const hard = s.search(/[。！？；!?;\n]/);
+  if (hard >= 4 && hard <= 20) {
+    s = s.slice(0, hard);
+  } else {
+    /* 2) 取 [6,20] 内最靠后的自然停顿（逗号/顿号/冒号） */
+    let cut = -1;
+    for (let i = 6; i <= Math.min(20, s.length - 1); i++) if ('，,、：:'.includes(s[i])) cut = i;
+    if (cut >= 6) s = s.slice(0, cut);
+    else { s = s.slice(0, 16); if (src.length > 16) s += '…'; }   // 3) 实在没有停顿才硬截
+  }
+  s = s.replace(/[，,、：:；;。\s]+$/, '').trim();
+  return (s || src.slice(0, 16)).slice(0, 24);
+}
+
+/* 显示用标题：把"旧式截前16字"的标题现算成可读标题。
+   放在显示层而不是只做一次性迁移，是为了让**任何来源**的数据都能立刻正确显示 ——
+   恢复/导入进来的会话是启动之后才落地的，只靠启动迁移会漏掉它们。
+   手动改过名的标题对不上旧式样，原样保留。 */
+function displayTitle(s) {
+  if (!s) return '新对话';
+  const firstQ = (s.msgs || []).find(m => m && m.role === 'user' && m.content);
+  if (!s.title) return (firstQ && cleanTitle(firstQ.content)) || '新对话';
+  if (firstQ && s.title === String(firstQ.content).slice(0, 16)) {
+    return cleanTitle(firstQ.content) || s.title;
+  }
+  return s.title;
+}
 let toastTimer = null;
 function toast(msg, ms) {
   const t = $('#toast');
@@ -132,7 +171,7 @@ const State = {
   if (Array.isArray(old) && old.length) {
     const firstQ = old.find(m => m.role === 'user');
     const id = uid();
-    saveLS('ws_sessions', [{ id, title: String((firstQ && firstQ.content) || '历史对话').slice(0, 16), ts: now(), msgs: old }]);
+    saveLS('ws_sessions', [{ id, title: cleanTitle((firstQ && firstQ.content) || '') || '历史对话', ts: now(), msgs: old }]);
     State.s.curSession = id;
     State.save();
   }
@@ -192,7 +231,7 @@ const Sessions = (() => {
     list[i].ts = now();
     if (!list[i].title) {
       const firstQ = msgs.find(m => m.role === 'user');
-      if (firstQ) list[i].title = String(firstQ.content).slice(0, 16);
+      if (firstQ) list[i].title = cleanTitle(firstQ.content);
     }
     _cache = list[i].msgs; _cacheKey = list[i].id;   // 缓存同步为落盘后的数组
     saveAll(list);
@@ -231,16 +270,36 @@ const Sessions = (() => {
   function exportMd(id) {
     const s = all().find(x => x.id === id);
     if (!s) return null;
-    const lines = ['# ' + (s.title || '问史对话'), '', '导出时间：' + new Date().toLocaleString('zh-CN'), ''];
+    const lines = ['# ' + displayTitle(s), '', '导出时间：' + new Date().toLocaleString('zh-CN'), ''];
     for (const m of (s.msgs || [])) {
       lines.push(m.role === 'user' ? '**我：**' : '**问史：**', '', String(m.content || ''), '');
     }
     return {
-      name: String(s.title || 'wenshi-history').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 24) + '.md',
+      name: String(displayTitle(s) || 'wenshi-history').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 24) + '.md',
       text: lines.join('\n'),
     };
   }
-  return { all, cur, curMsgs, ensure, put, switchTo, remove, newOne, clearAll, curId, invalidate, rename, setPinned, exportMd };
+  /* 一次性升级：把早期"直接截前 16 字"的标题换成可读标题。
+     只动"当前标题恰好等于旧式样"的会话 —— 手动改过名的对不上，不会被覆盖。 */
+  function migrateTitles() {
+    const list = all();
+    let n = 0;
+    for (const s of list) {
+      const firstQ = (s.msgs || []).find(m => m && m.role === 'user' && m.content);
+      if (!firstQ) continue;
+      const legacy = String(firstQ.content).slice(0, 16);
+      if (s.title && s.title === legacy) {
+        const t = cleanTitle(firstQ.content);
+        if (t && t !== s.title) { s.title = t; n++; }
+      } else if (!s.title) {
+        const t = cleanTitle(firstQ.content);
+        if (t) { s.title = t; n++; }
+      }
+    }
+    if (n) saveAll(list);
+    return n;
+  }
+  return { all, cur, curMsgs, ensure, put, switchTo, remove, newOne, clearAll, curId, invalidate, rename, setPinned, exportMd, migrateTitles };
 })();
 
 /* ===== 云端同步（照搬 vocab-flash 模式：裸 fetch + action 协议） ===== */
@@ -416,7 +475,7 @@ const Sync = (() => {
         const ts = cloud.reduce((m, x) => Math.max(m, x.ts || 0), 0);
         cloudSessions = [{
           id: 'legacy-' + ts,
-          title: String((firstQ && firstQ.content) || '历史对话').slice(0, 16),
+          title: cleanTitle((firstQ && firstQ.content) || '') || '历史对话',
           ts, msgs: cloud,
         }];
       }
@@ -1404,7 +1463,7 @@ const Me = (() => {
       // 兼容旧版备份：单聊天记录 → 转成一个会话
       const firstQ = j.hist.find(m => m.role === 'user');
       const id = uid();
-      saveLS('ws_sessions', [{ id, title: String((firstQ && firstQ.content) || '导入的对话').slice(0, 16), ts: now(), msgs: j.hist }]);
+      saveLS('ws_sessions', [{ id, title: cleanTitle((firstQ && firstQ.content) || '') || '导入的对话', ts: now(), msgs: j.hist }]);
       State.s.curSession = id;
       State.save();
     }
@@ -1599,7 +1658,7 @@ const SessPanel = (() => {
     let list = Sessions.all().slice();
     if (q) {
       list = list.filter(s => {
-        const hay = (s.title || '') + ' ' + (s.msgs || []).map(m => String(m.content || '')).join(' ');
+        const hay = displayTitle(s) + ' ' + (s.msgs || []).map(m => String(m.content || '')).join(' ');
         return hay.toLowerCase().includes(q);
       });
     }
@@ -1616,8 +1675,10 @@ const SessPanel = (() => {
     wrap.innerHTML = list.length
       ? list.map(s => `
         <div class="sess-item ${s.id === Sessions.curId() ? 'on' : ''}" data-sess="${esc(s.id)}">
-          <div class="sess-title">${s.pinned ? '<span class="sess-pin">置顶</span>' : ''}${esc(s.title || '新对话')}</div>
-          <div class="sess-meta">${(s.msgs || []).length} 条 · ${fmtTs(s.ts || 0)}</div>
+          <div class="sess-main">
+            <div class="sess-title">${s.pinned ? '<span class="sess-pin">置顶</span>' : ''}${esc(displayTitle(s))}</div>
+            <div class="sess-meta">${(s.msgs || []).length} 条 · ${fmtTs(s.ts || 0)}</div>
+          </div>
           <div class="sess-acts">
             <button class="mini-btn" data-sess-pin="${esc(s.id)}">${s.pinned ? '取消置顶' : '置顶'}</button>
             <button class="mini-btn" data-sess-rename="${esc(s.id)}">改名</button>
@@ -1627,7 +1688,13 @@ const SessPanel = (() => {
         </div>`).join('')
       : `<div class="tip">${q ? '没有匹配的对话' : '还没有历史对话'}</div>`;
   }
-  function open() { render(); $('#modal-sess').classList.remove('hidden'); }
+  /* 打开面板时顺手把旧式标题持久化升级一遍（幂等；显示层已能现算，
+     这一步是为了让改好的标题也真正存进本地与云端，导出文件也用得上） */
+  function open() {
+    try { Sessions.migrateTitles(); } catch (e) { /* 升级失败不该挡住面板 */ }
+    render();
+    $('#modal-sess').classList.remove('hidden');
+  }
   function close() { $('#modal-sess').classList.add('hidden'); }
   function bind() {
     $('#btn-sessions').addEventListener('click', open);
@@ -1669,7 +1736,7 @@ const SessPanel = (() => {
         ev.stopPropagation();
         const id = rn.getAttribute('data-sess-rename');
         const s = Sessions.all().find(x => x.id === id);
-        const t = prompt('给这段对话起个名字：', (s && s.title) || '');
+        const t = prompt('给这段对话起个名字：', displayTitle(s));
         if (t == null) return;
         Sessions.rename(id, t);
         render();
@@ -1716,6 +1783,8 @@ async function boot() {
     const t = ev.target.closest('[data-nav]');
     if (t) nav(t.getAttribute('data-nav'));
   });
+  /* 把旧式的"截前16字"标题升级成可读标题（幂等；手动改过名的不受影响） */
+  try { Sessions.migrateTitles(); } catch (e) { /* 标题升级失败不该影响启动 */ }
   Chat.bind(); KB.bind(); Me.bind(); SessPanel.bind(); Safety.bind();
   Me.fillSettings(); Me.renderCode();
   Chat.renderMsgs(); KB.render();
