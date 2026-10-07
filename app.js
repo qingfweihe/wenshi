@@ -1318,6 +1318,18 @@ const Me = (() => {
     });
     $('#me-review').addEventListener('click', manualReview);
     $('#me-checkupd').addEventListener('click', () => checkApkUpdate(true));
+    /* 安卓壳内：网页是 file:///android_asset/web/ 下的内嵌副本，相对路径 ./android/wenshi.apk
+       会解析到不存在的内嵌文件 → 点「下载 APK」必然失败。改走原生 DownloadManager。 */
+    const apkDl = $('#me-apk-dl');
+    if (apkDl) apkDl.addEventListener('click', (ev) => {
+      const sh = window.wsShell;
+      if (sh && typeof sh.downloadApk === 'function') {
+        ev.preventDefault();
+        try { sh.downloadApk(); toast('开始下载安装包…'); }
+        catch (e) { toast('下载失败：' + e.message); }
+      }
+      /* 网页版不拦截：走 <a download> 的正常下载 */
+    });
     $('#me-export').addEventListener('click', exportBackup);
     $('#me-import').addEventListener('click', () => $('#me-import-file').click());
     $('#me-import-file').addEventListener('change', async (ev) => {
