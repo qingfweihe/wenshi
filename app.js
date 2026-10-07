@@ -1503,7 +1503,16 @@ async function boot() {
   $$('.modal').forEach(m => m.addEventListener('click', (ev) => { if (ev.target === m) m.classList.add('hidden'); }));
 
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-    navigator.serviceWorker.register('./sw.js').then((reg) => {
+    const hadController = !!navigator.serviceWorker.controller;
+    /* 新 SW 接管后自动刷新一次：被旧缓存钉住的界面靠这一步解开，无需用户手动清缓存 */
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (reloaded || !hadController) return;
+      reloaded = true;
+      location.reload();
+    });
+    /* updateViaCache:'none' —— 更新检查时不走 HTTP 缓存，确保能拿到新的 sw.js */
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).then((reg) => {
       const showBar = () => {
         const bar = $('#web-update-bar');
         if (!bar || !bar.classList.contains('hidden')) return;
@@ -1511,7 +1520,8 @@ async function boot() {
         bar.textContent = '网页版有新版本，点此刷新';
         bar.onclick = () => location.reload();
       };
-      /* SW 是 stale-while-revalidate：发版后首次打开仍可能拿到旧版，故主动提示刷新 */
+      /* 立即查一次：浏览器默认最长 24h 才检查 sw.js，等不起 */
+      reg.update().catch(() => {});
       if (reg.waiting && navigator.serviceWorker.controller) showBar();
       reg.addEventListener('updatefound', () => {
         const nw = reg.installing;
