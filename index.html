@@ -82,11 +82,16 @@
         <div class="row-label">状态</div>
         <div class="row-val" id="me-sync-state">—</div>
       </div>
+      <div class="row">
+        <div class="row-label">同步口令</div>
+        <div class="row-val" id="me-pw-state">未设置</div>
+        <button id="me-pw-set" class="mini-btn">设置</button>
+      </div>
       <div class="btn-row">
         <button id="me-backup" class="mini-btn wide">立即备份</button>
         <button id="me-restore" class="mini-btn wide">从云端恢复</button>
       </div>
-      <div class="tip">换手机时：新手机装好 App → 我的 → 输入（或粘贴）同步码 → 从云端恢复。</div>
+      <div class="tip">重装、换机后只要还记得<b>同步口令</b>，输入同一口令即可找回全部数据（对话 / 记忆 / 法则 / 知识库）。没设口令的话，就只能靠抄下来的同步码。</div>
     </div>
 
     <div class="card">
@@ -178,6 +183,45 @@
       <button id="modal-code-cancel" class="mini-btn wide">取消</button>
       <button id="modal-code-ok" class="mini-btn wide primary">恢复</button>
     </div>
+    <div class="modal-alt"><button id="mc-to-pass">忘了同步码？改用口令恢复 →</button></div>
+  </div>
+</div>
+
+<!-- 设置同步口令弹窗 -->
+<div class="modal hidden" id="modal-pass">
+  <div class="modal-box">
+    <div class="modal-title">设置同步口令</div>
+    <div class="tip" style="margin:0 0 10px">口令会派生出你的专属同步码。重装或换手机后，只要输入<b>同一个口令</b>就能把数据全部找回。<br><b>口令一旦忘记就无法找回</b>，请自己记牢；也可以另外抄一份同步码做双保险。</div>
+    <input id="mp-pw" type="password" maxlength="32" placeholder="同步口令（至少 6 位）" autocomplete="new-password">
+    <input id="mp-pw2" type="password" maxlength="32" placeholder="再输一次" autocomplete="new-password">
+    <div class="mp-tip" id="mp-tip"></div>
+    <div class="btn-row">
+      <button id="mp-cancel" class="mini-btn wide">取消</button>
+      <button id="mp-ok" class="mini-btn wide primary">设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- 首次启动数据安全引导 -->
+<div class="modal hidden" id="modal-safety">
+  <div class="modal-box">
+    <div class="modal-title">先花 10 秒，保住你的数据</div>
+    <div class="tip" style="margin:0 0 12px">对话、记忆、法则、知识库都只存在这台手机里。<b>卸载重装或换手机，它们就没了</b> —— 除非你留下下面任意一样。</div>
+    <div class="sf-row">
+      <span class="sf-label">同步码</span>
+      <b class="mono" id="sf-code">—</b>
+      <button id="sf-copy" class="mini-btn">复制</button>
+    </div>
+    <div class="sf-sep">或者，设个自己记得住的口令（推荐）</div>
+    <input id="sf-pw" type="password" maxlength="32" placeholder="同步口令（至少 6 位）" autocomplete="new-password">
+    <input id="sf-pw2" type="password" maxlength="32" placeholder="再输一次" autocomplete="new-password">
+    <div class="mp-tip" id="sf-tip"></div>
+    <div class="btn-row">
+      <button id="sf-later" class="mini-btn wide">我已抄下同步码</button>
+      <button id="sf-setpw" class="mini-btn wide primary">用口令保护</button>
+    </div>
+    <div class="modal-alt"><button id="sf-restore">我以前用过问史，去恢复数据 →</button></div>
+    <div class="sf-foot">当前状态：<span id="sf-pw-state">尚未保护</span></div>
   </div>
 </div>
 
