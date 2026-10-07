@@ -412,14 +412,21 @@ select#me-model {
 /* 历史对话面板 */
 .sess-box { display: flex; flex-direction: column; max-height: 72vh; }
 .sess-list { flex: 1; overflow-y: auto; min-height: 0; margin-bottom: 12px; }
+/* 历史条目：两行式。此前是单行 flex，标题与 4 个操作按钮同行，
+   按钮不换行 → 标题被挤到接近零宽，看起来"只有日期"。 */
 .sess-item {
-  display: flex; align-items: center; gap: 8px;
-  padding: 10px 6px; border-bottom: 1px dashed var(--pink-line);
+  display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+  padding: 10px 8px; border-bottom: 1px dashed var(--pink-line);
   border-radius: 8px;
 }
 .sess-item.on { background: var(--pink-soft); }
-.sess-title { flex: 1; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sess-meta { font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+.sess-main { display: flex; align-items: baseline; gap: 8px; }
+.sess-title {
+  flex: 1; min-width: 0; font-size: 14px; font-weight: 600; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sess-meta { font-size: 11px; color: var(--ink-3); white-space: nowrap; flex: 0 0 auto; }
+.sess-acts { display: flex; gap: 6px; justify-content: flex-end; }
 
 /* 打字机光标 */
 .caret { display: inline-block; width: 2px; height: 1em; background: var(--pink); margin-left: 2px; vertical-align: -2px; animation: caretBlink 0.8s step-end infinite; }
