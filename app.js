@@ -120,7 +120,7 @@ function saveLS(key, v) {
 
 const State = {
   s: loadLS(LS.state, null) || {
-    syncCode: '', syncOn: true, model: '', digestOn: true, kbOn: true, curSession: '',
+    syncCode: '', syncOn: true, model: '', digestOn: true, kbOn: true, curSession: '', pwMode: false,
   },
   save() { saveLS(LS.state, this.s); },
 };
@@ -246,7 +246,9 @@ const Sessions = (() => {
 /* ===== 云端同步（照搬 vocab-flash 模式：裸 fetch + action 协议） ===== */
 const API_DEFAULT = 'https://qinfweihe1-d5gxpjjli9f8f238b.service.tcloudbase.com/wsapi';
 /* 云端只备份轻量数据；知识库(kb)只存本地（用户要求，云端容量有限），靠导出文件迁移 */
-const DOMAINS = ['hist', 'mem', 'settings', 'rules'];
+/* 云同步数据域。kb（知识库）原先只存本地，但重装/换机必丢且体量最大，故已并入云备份。
+   改动需与服务端 wsapi/index.js 的 DOMAINS 保持一致。 */
+const DOMAINS = ['hist', 'mem', 'settings', 'rules', 'kb'];
 const PUSH_DELAY = 30 * 1000;
 
 const Sync = (() => {
@@ -325,7 +327,20 @@ const Sync = (() => {
   /* 域数据快照 */
   function snapshot(domain) {
     if (domain === 'hist') return { sessions: loadLS('ws_sessions', []), cur: Sessions.curId() };
-    if (domain === 'kb') return loadLS(LS.kb, []);
+    if (domain === 'kb') {
+      /* 服务端单域上限 256KB（MAX_STATE_CHARS），超限会整域备份失败。
+         故按「新条目优先」截断到 240KB 以内，宁可旧条目暂不上云，也不能整体备份挂掉。 */
+      const all = loadLS(LS.kb, []);
+      const CAP = 240 * 1024;
+      const out = [];
+      let len = 2;
+      for (const e of all) {
+        const s = JSON.stringify(e).length;
+        if (len + s > CAP) break;
+        out.push(e); len += s + 1;
+      }
+      return out;
+    }
     if (domain === 'mem') return loadLS(LS.mem, { profile: '', ts: 0 });
     if (domain === 'rules') return loadLS(LS.rules, []);
     if (domain === 'settings') {
@@ -353,8 +368,8 @@ const Sync = (() => {
   }
 
   async function pushAll(force) {
-    if (!State.s.syncOn || !State.s.syncCode) return;
-    if (pushing) return;
+    if (!State.s.syncOn || !State.s.syncCode) return false;
+    if (pushing) return false;
     pushing = true;
     try {
       for (const d of DOMAINS) {
@@ -368,8 +383,10 @@ const Sync = (() => {
       }
       saveLS('ws_sync_hashes', hashes);
       setSyncState('已备份 ' + new Date().toTimeString().slice(0, 5));
+      return true;
     } catch (e) {
       setSyncState('备份失败：' + e.message);
+      return false;   // 返回值供调用方判断是否真的落库（口令启用等关键路径必须知道结果）
     } finally { pushing = false; }
   }
 
@@ -472,6 +489,8 @@ const Sync = (() => {
       /* renderCode 定义在 Me 模块内，此处不可裸调用（此前裸调 → ReferenceError 被 catch 吞成"离线模式"） */
       if (typeof Me !== 'undefined' && Me.renderCode) Me.renderCode();
       markDirty();
+      /* 新码只在这里出现一次，必须趁现在把「抄下它 / 设口令」摆到用户面前 */
+      if (typeof Safety !== 'undefined' && Safety.maybeShow) Safety.maybeShow();
       return j.code;
     } catch (e) {
       setSyncState('离线模式：' + e.message);
@@ -505,6 +524,188 @@ const Sync = (() => {
   }
 
   return { request, markDirty, pushAll, restore, ensureCode, init, setSyncState };
+})();
+
+/* ===== 口令式同步码 =====
+   同步码是云端数据的唯一身份，却只存在 localStorage 里 —— 重装即销毁，
+   云端那份数据从此成为没人能认领的孤儿。这是「重装丢数据」的根本原因。
+   解法：让同步码可以由用户记得住的口令**确定性派生**出来。同一口令在任何设备、
+   任何时间都得到同一个码，所以重装后只要还记得口令，就能把数据全部找回。
+
+   派生完全在前端完成，服务端不需要任何改动 —— 已确认 state.put 只校验格式
+   （CODE_RE = /^[A-Z2-7]{12}$/）而不校验归属，任意合法码都能直接写入并自动建档。
+
+   算法：PBKDF2-SHA256(口令, 固定盐, 100000 轮) → 取 64 位 → RFC4648 base32 → 前 12 位。
+   注意两处约束：
+   1) crypto.subtle 是唯一实现，**不做降级**。降级算法会算出不同的码，比直接报错危险得多。
+   2) deriveBits 的位数必须是 8 的倍数，故取 64 位（base32 后 12.8 字符，切前 12 位即合规）。
+   已实测 file:// 与 https 两种环境下 isSecureContext 均为 true、crypto.subtle 均可用。 */
+const Pass = (() => {
+  const SALT = 'wenshi-sync-v1';
+  const ROUNDS = 100000;
+  const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const MIN_LEN = 6;
+
+  function available() {
+    return !!(window.crypto && window.crypto.subtle && window.TextEncoder);
+  }
+
+  async function derive(pw) {
+    if (!available()) throw new Error('当前环境不支持口令派生，请改用随机同步码');
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode(String(pw)), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt: enc.encode(SALT), iterations: ROUNDS, hash: 'SHA-256' }, key, 64);
+    let acc = 0, n = 0, out = '';
+    for (const byte of new Uint8Array(bits)) {
+      acc = (acc << 8) | byte; n += 8;
+      while (n >= 5) { out += B32[(acc >>> (n - 5)) & 31]; n -= 5; }
+    }
+    return out.slice(0, 12);
+  }
+
+  function check(pw, pw2) {
+    const p = String(pw || '');
+    if (p.length < MIN_LEN) return '口令至少 ' + MIN_LEN + ' 位';
+    if (p.length > 32) return '口令最多 32 位';
+    if (pw2 != null && p !== String(pw2)) return '两次输入的口令不一致';
+    return '';
+  }
+
+  /* 应用口令：派生码 → 先把该码下已有的云端数据并回本地 → 再把本地全量写回该码。
+     重装（本地为空）时是「拉回」；平时改口令时是「两边并集」。两条路径都不会丢数据。 */
+  async function apply(pw) {
+    const code = await derive(pw);
+    const oldCode = State.s.syncCode;
+    const oldMode = State.s.pwMode;
+    State.s.syncCode = code;
+
+    let pulled = 0;
+    try {
+      pulled = await Sync.restore(code);          // 码不存在会抛 NO_SUCH_CODE，属正常（首次启用）
+    } catch (e) {
+      if (e.code !== 'NO_SUCH_CODE' && e.status !== 404) {
+        State.s.syncCode = oldCode; State.s.pwMode = oldMode; State.save();   // 失败回滚，不留半截状态
+        throw e;
+      }
+    }
+
+    State.s.pwMode = true;
+    State.s.syncOn = true;                        // 口令模式必须开着同步，否则等于没保护
+    State.save();
+    /* 关键：必须让调用方知道备份到底成没成。
+       口令生效了但云端没写上去，用户会以为自己受保护了 —— 那比报错更危险。 */
+    const backed = await Sync.pushAll(true);
+    return { pulled, backed };
+  }
+
+  return { derive, apply, check, available, MIN_LEN };
+})();
+
+/* ===== 首次启动「数据安全」引导 =====
+   同步码只在「我的」页默默显示，用户从来不会主动去看 —— 也就无从知道自己需要保存它。
+   故拿到同步码后弹一次，把两条路摆在明面上：抄下随机码，或设一个自己记得住的口令。 */
+const Safety = (() => {
+  const KEY = 'ws_seen_safety';
+
+  function dismiss() {
+    try { localStorage.setItem(KEY, '1'); } catch (e) { /* 隐私模式下写不了，忽略 */ }
+    const m = $('#modal-safety'); if (m) m.classList.add('hidden');
+  }
+
+  function maybeShow() {
+    if (localStorage.getItem(KEY) || !State.s.syncCode) return;
+    const m = $('#modal-safety');
+    if (!m) return;
+    const c = $('#sf-code'); if (c) c.textContent = State.s.syncCode;
+    const pw = $('#sf-pw-state');
+    if (pw) pw.textContent = State.s.pwMode ? '已启用口令保护' : '尚未保护';
+    m.classList.remove('hidden');
+  }
+
+  /* 通用的「设置口令」提交流程，首次引导与设置页共用 */
+  async function submit(pwEl, pw2El, tipEl, onOk) {
+    const say = (t) => { if (tipEl) tipEl.textContent = t; else if (t) toast(t, 3500); };
+    const bad = Pass.check(pwEl.value, pw2El ? pw2El.value : null);
+    if (bad) { say(bad); return false; }
+    say('正在派生同步码…（约需 1 秒）');
+    try {
+      const r = await Pass.apply(pwEl.value);
+      pwEl.value = ''; if (pw2El) pw2El.value = '';
+      say('');
+      if (onOk) onOk(r);
+      return true;
+    } catch (e) {
+      say('设置失败：' + e.message);
+      return false;
+    }
+  }
+
+  function openPassModal(hint) {
+    const m = $('#modal-pass');
+    if (!m) return;
+    $('#mp-pw').value = ''; $('#mp-pw2').value = '';
+    $('#mp-tip').textContent = hint || '';
+    m.classList.remove('hidden');
+    $('#mp-pw').focus();
+  }
+
+  function afterOk(r, msg) {
+    const n = (r && r.pulled) || 0;
+    if (r && r.backed === false) {
+      /* 口令本身已生效，但云端没写上去 —— 必须说清楚，否则用户以为已经受保护了 */
+      toast(msg + '；但云端备份未成功，请联网后到「我的 → 立即备份」补一次', 7000);
+    } else {
+      toast(n ? (msg + '，并从云端找回 ' + n + ' 类数据') : msg, 4000);
+    }
+    Me.renderCode(); Me.fillSettings();
+  }
+
+  function bind() {
+    const copy = $('#sf-copy');
+    if (copy) copy.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(State.s.syncCode); toast('同步码已复制'); }
+      catch (e) { toast('复制失败，请手动抄下：' + State.s.syncCode, 8000); }
+    });
+    const later = $('#sf-later');
+    if (later) later.addEventListener('click', () => {
+      dismiss();
+      toast('已跳过。以后可在「我的 → 同步口令」里设置，口令能防止重装丢数据', 5000);
+    });
+    const sfSet = $('#sf-setpw');
+    if (sfSet) sfSet.addEventListener('click', () => {
+      submit($('#sf-pw'), $('#sf-pw2'), $('#sf-tip'), (r) => {
+        dismiss(); afterOk(r, '已用口令保护');
+      });
+    });
+
+    /* 重装/换机进来的用户：这条比「抄码」更贴切 */
+    const sfRes = $('#sf-restore');
+    if (sfRes) sfRes.addEventListener('click', () => {
+      dismiss();
+      $('#modal-code-input').value = '';
+      $('#modal-code').classList.remove('hidden');
+      $('#modal-code-input').focus();
+    });
+    const meSet = $('#me-pw-set');
+    if (meSet) meSet.addEventListener('click', () => openPassModal(''));
+    const mpCancel = $('#mp-cancel');
+    if (mpCancel) mpCancel.addEventListener('click', () => $('#modal-pass').classList.add('hidden'));
+    const mpOk = $('#mp-ok');
+    if (mpOk) mpOk.addEventListener('click', () => {
+      submit($('#mp-pw'), $('#mp-pw2'), $('#mp-tip'), (r) => {
+        $('#modal-pass').classList.add('hidden'); afterOk(r, '已用口令保护');
+      });
+    });
+    /* 恢复弹窗里的兜底：忘了同步码不要紧，输口令也行 */
+    const toPass = $('#mc-to-pass');
+    if (toPass) toPass.addEventListener('click', () => {
+      $('#modal-code').classList.add('hidden');
+      openPassModal('输入你设过的口令。口令相同，就会回到同一份云数据。');
+    });
+  }
+
+  return { maybeShow, bind, dismiss };
 })();
 
 /* ===== 记忆档案 ===== */
@@ -547,7 +748,11 @@ const SVG = (() => {
 /* ===== 知识库 ===== */
 const KB = (() => {
   function all() { return loadLS(LS.kb, []); }
-  function save(list) { saveLS(LS.kb, list.slice(0, 500)); }   // 知识库只在本地，不进云同步
+  function save(list) {
+    saveLS(LS.kb, list.slice(0, 500));
+    /* 知识库现已并入云备份（此前只存本地，重装即丢）。Sync 定义在前，此处可安全引用 */
+    if (typeof Sync !== 'undefined' && Sync.markDirty) Sync.markDirty('kb');
+  }
 
   /* 关键词打分：标题*3 + 标签*2 + 内容*1 */
   function score(q, e) {
@@ -1122,6 +1327,10 @@ const Me = (() => {
   function renderCode() {
     const el = $('#me-code');
     if (el) el.textContent = State.s.syncCode || '未生成';
+    const st = $('#me-pw-state');
+    if (st) st.textContent = State.s.pwMode ? '已启用（由口令派生）' : '未设置';
+    const btn = $('#me-pw-set');
+    if (btn) btn.textContent = State.s.pwMode ? '更换' : '设置';
   }
 
   function fillModelSelect() {
@@ -1155,13 +1364,29 @@ const Me = (() => {
       mem: loadLS(LS.mem, { profile: '', ts: 0 }),
       rules: loadLS(LS.rules, []), meta: loadLS(LS.meta, { rounds: 0 }),
       settings: { model: State.s.model, digestOn: State.s.digestOn, kbOn: State.s.kbOn },
+      /* 一并带上云同步身份，这样「导出文件 → 重装 → 导入文件」能把云端身份也找回来 */
+      syncCode: State.s.syncCode || '', syncOn: !!State.s.syncOn,
     };
-    const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
+    const json = JSON.stringify(data, null, 1);
     const d = new Date();
     const p = (n) => (n < 10 ? '0' + n : '' + n);
-    a.download = `问史备份_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}.json`;
+    const name = `问史备份_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}.json`;
+
+    /* 安卓壳：页面在 file:///android_asset/web/ 下，壳又没设 DownloadListener，
+       Blob + a.download 不会落盘（点了没反应）。改走原生桥写进系统「下载」目录 ——
+       那个位置不随卸载消失，重装后还在。 */
+    const sh = window.wsShell;
+    if (sh && typeof sh.saveFile === 'function') {
+      let r = '';
+      try { r = sh.saveFile(name, json) || ''; } catch (e) { r = ''; }
+      toast(r ? ('已导出到「' + r + '」') : '导出失败：请检查系统的存储权限', 5000);
+      return;
+    }
+
+    const blob = new Blob([json], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
@@ -1192,6 +1417,17 @@ const Me = (() => {
       if (typeof j.settings.kbOn === 'boolean') State.s.kbOn = j.settings.kbOn;
       State.save();
     }
+    /* 备份里带着云同步身份（同步码）时一并采用 —— 仅当本地还没有码，避免覆盖当前身份。
+       这样「导出文件 → 重装 → 导入文件」能连云端关系一起恢复。 */
+    if (!State.s.syncCode && typeof j.syncCode === 'string' && /^[A-Z2-7]{12}$/.test(j.syncCode)) {
+      State.s.syncCode = j.syncCode;
+      if (typeof j.syncOn === 'boolean') State.s.syncOn = j.syncOn;
+      State.save();
+      renderCode();
+      toast('已同时恢复云同步身份（' + j.syncCode + '）', 5000);
+    }
+    Sessions.invalidate();          // 直接写了 ws_sessions，必须让会话缓存失效，否则读到的还是旧列表
+    Sync.markDirty('hist');
     Chat.renderMsgs(); KB.render(); fillSettings();
     toast('导入完成');
   }
@@ -1467,7 +1703,7 @@ async function boot() {
     const t = ev.target.closest('[data-nav]');
     if (t) nav(t.getAttribute('data-nav'));
   });
-  Chat.bind(); KB.bind(); Me.bind(); SessPanel.bind();
+  Chat.bind(); KB.bind(); Me.bind(); SessPanel.bind(); Safety.bind();
   Me.fillSettings(); Me.renderCode();
   Chat.renderMsgs(); KB.render();
   nav('chat');
