@@ -23,24 +23,75 @@ function toast(msg, ms) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.add('hidden'), ms || 2200);
 }
-/* 轻量 markdown：先整体转义（防 XSS），再逐行转换；模型偶尔输出 HTML 标签，先归一化 */
+/* 轻量 markdown：先整体转义（防 XSS），再逐行转换；模型偶尔输出 HTML 标签，先归一化。
+   支持：粗体 / 斜体 / 删除线 / 行内代码 / 围栏代码块 / 标题 / 有序无序列表 / 表格 / 引用 / 链接 / 分隔线。
+   链接只放行 http(s)，防 javascript: / data: 注入；代码块内容单独转义，不参与其它语法解析。 */
 function mdLite(raw) {
   const norm = String(raw || '')
     .replace(/<b\s*>/gi, '**').replace(/<\/b\s*>/gi, '**')
     .replace(/<strong\s*>/gi, '**').replace(/<\/strong\s*>/gi, '**')
     .replace(/<br\s*\/?>/gi, '\n');
-  const lines = norm.split(/\r?\n/);
+
+  /* 1) 围栏代码块整段摘出为占位符，避免块内 md 语法被误转换 */
+  const codes = [];
+  const src = norm.replace(/```[ \t]*([\w+#.:-]*)[ \t]*\n?([\s\S]*?)```/g, (m, lang, code) => {
+    codes.push({ lang: String(lang || '').trim(), code: String(code).replace(/\n+$/, '') });
+    return '\u0001C' + (codes.length - 1) + '\u0001';
+  });
+
+  /* 2) 行内语法（入参必须是已转义文本） */
+  const inline = (s) => String(s)
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^\n]+?)\*\*/g, '<b>$1</b>')
+    .replace(/~~([^\n]+?)~~/g, '<s>$1</s>')
+    .replace(/(^|[\s（(【])\*([^*\n]+?)\*(?=$|[\s，。；：！？、）)】])/g, '$1<i>$2</i>')
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+  const isSep = (s) => /^[\s|:-]+$/.test(s) && /-/.test(s);
+  const lines = src.split(/\r?\n/);
   let out = '', inOl = false;
   const closeOl = () => { if (inOl) { out += '</div>'; inOl = false; } };
-  const bold = (s) => s.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
-  for (let rawLn of lines) {
-    const ln = bold(esc(rawLn));
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLn = lines[i];
+
+    /* 代码块占位符 */
+    const ph = rawLn.trim().match(/^\u0001C(\d+)\u0001$/);
+    if (ph) {
+      closeOl();
+      const c = codes[Number(ph[1])] || { code: '', lang: '' };
+      out += '<pre class="md-pre"' + (c.lang ? ' data-lang="' + esc(c.lang) + '"' : '') + '><code>' + esc(c.code) + '</code></pre>';
+      continue;
+    }
+
+    /* 表格：本行含 |，且下一行是 |---| 分隔行 */
+    if (rawLn.indexOf('|') >= 0 && i + 1 < lines.length && isSep(lines[i + 1]) && lines[i + 1].indexOf('-') >= 0) {
+      const cells = (r) => r.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => inline(esc(c.trim())));
+      const head = cells(rawLn);
+      i++;                                   // 吃掉分隔行
+      let body = '';
+      while (i + 1 < lines.length && lines[i + 1].trim() && lines[i + 1].indexOf('|') >= 0) {
+        i++;
+        const cs = cells(lines[i]);
+        body += '<tr>' + head.map((_, k) => '<td>' + (cs[k] == null ? '' : cs[k]) + '</td>').join('') + '</tr>';
+      }
+      closeOl();
+      out += '<div class="md-tbl-wrap"><table class="md-tbl"><thead><tr>'
+        + head.map(h => '<th>' + h + '</th>').join('')
+        + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+      continue;
+    }
+
+    const ln = inline(esc(rawLn));
     if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(ln)) { closeOl(); out += '<hr>'; continue; }
     const h = ln.match(/^\s*(#{1,4})\s+(.*)$/);
     if (h) { closeOl(); out += `<span class="md-h${h[1].length}"><b>${h[2]}</b></span><br>`; continue; }
     const ol = ln.match(/^\s*\d+[.、)]\s+(.*)$/);
     if (ol) { if (!inOl) { out += '<div class="md-ol">'; inOl = true; } out += `<div class="md-oli">${ol[1]}</div>`; continue; }
     closeOl();
+    const bq = ln.match(/^\s*&gt;\s?(.*)$/);
+    if (bq) { out += `<div class="md-quote">${bq[1]}</div>`; continue; }
     if (/^\s*[-*•·]\s+/.test(ln)) { out += `<span class="md-li">${ln.replace(/^\s*[-*•·]\s+/, '')}</span>`; continue; }
     if (!ln.trim()) { out += '<span class="md-gap"></span>'; continue; }
     out += ln + '<br>';
@@ -160,7 +211,36 @@ const Sessions = (() => {
     invalidate();
     Sync.markDirty('hist');
   }
-  return { all, cur, curMsgs, ensure, put, switchTo, remove, newOne, clearAll, curId, invalidate };
+  /* 重命名 / 置顶（置顶排前）/ 导出单条对话 */
+  function rename(id, title) {
+    const list = all();
+    const i = list.findIndex(s => s.id === id);
+    if (i < 0) return;
+    const t = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 30);
+    if (t) list[i].title = t;
+    saveAll(list);
+  }
+  function setPinned(id, v) {
+    const list = all();
+    const i = list.findIndex(s => s.id === id);
+    if (i < 0) return;
+    list[i].pinned = !!v;
+    list.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.ts || 0) - (a.ts || 0));
+    saveAll(list);
+  }
+  function exportMd(id) {
+    const s = all().find(x => x.id === id);
+    if (!s) return null;
+    const lines = ['# ' + (s.title || '问史对话'), '', '导出时间：' + new Date().toLocaleString('zh-CN'), ''];
+    for (const m of (s.msgs || [])) {
+      lines.push(m.role === 'user' ? '**我：**' : '**问史：**', '', String(m.content || ''), '');
+    }
+    return {
+      name: String(s.title || 'wenshi-history').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 24) + '.md',
+      text: lines.join('\n'),
+    };
+  }
+  return { all, cur, curMsgs, ensure, put, switchTo, remove, newOne, clearAll, curId, invalidate, rename, setPinned, exportMd };
 })();
 
 /* ===== 云端同步（照搬 vocab-flash 模式：裸 fetch + action 协议） ===== */
@@ -172,9 +252,15 @@ const PUSH_DELAY = 30 * 1000;
 const Sync = (() => {
   const api = () => (localStorage.getItem(LS.api) || API_DEFAULT).trim() || API_DEFAULT;
 
-  async function request(action, payload, timeoutMs) {
+  async function rawRequest(action, payload, timeoutMs, externalSignal) {
     const body = { action, code: State.s.syncCode || '', ...(payload || {}) };
     const ctl = new AbortController();
+    let byUser = false;
+    const onAbort = () => { byUser = true; ctl.abort(); };
+    if (externalSignal) {
+      if (externalSignal.aborted) { byUser = true; ctl.abort(); }
+      else externalSignal.addEventListener('abort', onAbort, { once: true });
+    }
     const timer = setTimeout(() => ctl.abort(), timeoutMs || 15000);
     let res;
     try {
@@ -184,15 +270,56 @@ const Sync = (() => {
         body: JSON.stringify(body),
         signal: ctl.signal,
       });
-    } finally { clearTimeout(timer); }
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        const err = new Error(byUser ? '已停止' : '请求超时');
+        err.abortedByUser = byUser;
+        err.timeout = !byUser;
+        throw err;
+      }
+      const err = new Error('网络不可用：' + ((e && e.message) || '连接失败'));
+      err.network = true;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
+    }
     let j = null;
-    try { j = await res.json(); } catch (e) { throw new Error('服务返回异常(' + res.status + ')'); }
+    try { j = await res.json(); }
+    catch (e) {
+      const err = new Error('服务返回异常(' + res.status + ')');
+      err.network = res.status >= 500;
+      err.status = res.status;
+      throw err;
+    }
     if (!j || j.ok !== true) {
       const err = new Error((j && j.message) || ('HTTP ' + res.status));
       err.code = j && j.error;
+      err.status = res.status;
       throw err;
     }
     return j;
+  }
+
+  /* 网络类错误自动重试（指数退避）；业务错误（LIMIT / AI_AUTH / BAD_CODE…）不重试 */
+  const RETRYABLE = new Set(['AI_UPSTREAM', 'AI_EMPTY', 'READ_ERR', 'NO_USER']);
+  async function request(action, payload, timeoutMs, opts) {
+    const o = opts || {};
+    const tries = o.retries == null ? 0 : o.retries;
+    let lastErr = null;
+    for (let i = 0; i <= tries; i++) {
+      try {
+        return await rawRequest(action, payload, timeoutMs, o.signal);
+      } catch (e) {
+        lastErr = e;
+        if (e.abortedByUser || e.timeout) throw e;
+        const retryable = e.network === true || (e.code && RETRYABLE.has(e.code)) || (!e.code && e.status >= 500);
+        if (!retryable || i === tries) throw e;
+        if (o.onRetry) o.onRetry(i + 1);
+        await new Promise(r => setTimeout(r, 700 * Math.pow(2, i)));
+      }
+    }
+    throw lastErr;
   }
 
   /* 域数据快照 */
@@ -342,7 +469,8 @@ const Sync = (() => {
       const j = await request('init');
       State.s.syncCode = j.code;
       State.save();
-      renderCode();
+      /* renderCode 定义在 Me 模块内，此处不可裸调用（此前裸调 → ReferenceError 被 catch 吞成"离线模式"） */
+      if (typeof Me !== 'undefined' && Me.renderCode) Me.renderCode();
       markDirty();
       return j.code;
     } catch (e) {
@@ -352,7 +480,8 @@ const Sync = (() => {
   }
 
   async function init() {
-    renderCode();
+    /* 同上：必须走 Me.renderCode，裸调用会抛 ReferenceError 并中断整个云同步初始化 */
+    if (typeof Me !== 'undefined' && Me.renderCode) Me.renderCode();
     setSyncState(State.s.syncCode ? (lastState || '待同步') : '未生成');
     if (State.s.syncCode && State.s.syncOn) {
       try {
@@ -547,8 +676,42 @@ const KB = (() => {
 /* ===== 问答 ===== */
 const Chat = (() => {
   let sending = false;
+  let stopCtl = null;       // 当前请求的中断句柄（停止生成）
+  let editIdx = null;       // 正在编辑重发的消息下标
   const HIST_MAX = 120, CTX_MAX = 12;
   const REASONS = ['太浅了', '大俗话', '太理论', '例子不好', '立场偏了', '太长'];
+
+  /* 无障碍：只播报最新一条回答，避免整块重渲染被反复朗读 */
+  function announce(t) { const el = $('#sr-live'); if (el) el.textContent = t; }
+  function setSendMode(on) {
+    const b = $('#chat-send');
+    if (!b) return;
+    b.classList.toggle('stop', on);
+    b.innerHTML = on ? '■' : '↑';
+    b.setAttribute('aria-label', on ? '停止生成' : '发送');
+  }
+  function startEdit(idx) {
+    const m = hist()[idx];
+    if (!m || m.role !== 'user') return;
+    editIdx = idx;
+    const input = $('#chat-input');
+    input.value = String(m.content || '');
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    const bar = $('#edit-bar');
+    if (bar) bar.classList.remove('hidden');
+    input.focus();
+    toast('改完直接发送，将从这条重新开始');
+  }
+  function cancelEditBar() { const bar = $('#edit-bar'); if (bar) bar.classList.add('hidden'); }
+  function cancelEdit() {
+    editIdx = null;
+    cancelEditBar();
+    const input = $('#chat-input');
+    input.value = '';
+    input.style.height = 'auto';
+    input.focus();
+  }
 
   function hist() { return Sessions.curMsgs(); }
   function saveHist(h) { Sessions.put(h, HIST_MAX); }
@@ -574,9 +737,9 @@ const Chat = (() => {
     stopTypewriter(false);
     const len = fullText.length;
     if (!len) return;
-    // 总时长 1.8s ~ 6s 自适应：短答案快些，长答案别拖沓
-    const dur = Math.min(6000, Math.max(1800, len * 26));
-    const tick = 40;
+    // 内容其实已经到手，逐字只为可读性：总时长压到 0.6s~2.4s，点一下可立即显示全文
+    const dur = Math.min(2400, Math.max(600, len * 10));
+    const tick = 32;
     const per = Math.max(1, Math.ceil(len / (dur / tick)));
     typingState = { idx, shown: Math.min(per, len) };
     renderMsgs();
@@ -632,7 +795,16 @@ const Chat = (() => {
     const empty = $('#chat-empty');
     if (empty) empty.classList.toggle('hidden', h.length > 0);
     $$('.msg', wrap).forEach(m => m.remove());
+    $$('.ctx-note', wrap).forEach(m => m.remove());
     const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 80;
+    /* 超出上下文窗口的轮次会被折叠成摘要送进 AI，这里如实告知用户 */
+    if (h.length > CTX_MAX) {
+      const droppedQ = h.slice(0, h.length - CTX_MAX).filter(m => m.role === 'user').length;
+      if (droppedQ > 0) {
+        wrap.insertAdjacentHTML('afterbegin',
+          `<div class="ctx-note">较早的 ${droppedQ} 个问题已折叠为上下文摘要，仍会影响回答</div>`);
+      }
+    }
     const shown = h.slice(-60);
     const base = h.length - shown.length;
     for (let i = 0; i < shown.length; i++) {
@@ -640,7 +812,11 @@ const Chat = (() => {
       const idx = base + i;
       if (m.role === 'user') {
         wrap.insertAdjacentHTML('beforeend', `
-          <div class="msg user"><div class="bubble">${esc(m.content).replace(/\n/g, '<br>')}</div></div>`);
+          <div class="msg user" data-idx="${idx}"><div class="bubble">${esc(m.content).replace(/\n/g, '<br>')}</div>
+          <div class="fb-bar user-bar">
+            <button class="fb-btn" data-copy="${idx}">${SVG.copy}复制</button>
+            <button class="fb-btn" data-edit="${idx}">编辑</button>
+          </div></div>`);
       } else {
         const content = (typingState && typingState.idx === idx)
           ? mdLite(String(m.content || '').slice(0, typingState.shown)) + '<span class="caret"></span>'
@@ -654,15 +830,18 @@ const Chat = (() => {
 
   /* 等待期提示：三个点 + 超时换文案（长问题 pro 模型会等较久） */
   let waitLabel = null;
+  function setWaitText(t) { if (waitLabel && waitLabel.el) waitLabel.el.textContent = t; }
   function showTyping() {
     $('#chat-msgs').insertAdjacentHTML('beforeend', `
-      <div class="msg bot" id="msg-typing"><div class="bubble"><span class="typing"><i></i><i></i><i></i></span><span id="typing-label" style="font-size:12px;color:var(--ink-3);margin-left:6px"></span></div></div>`);
+      <div class="msg bot" id="msg-typing"><div class="bubble"><span class="typing"><i></i><i></i><i></i></span><span id="typing-label"></span></div></div>`);
     $('#chat-msgs').scrollTop = 1e9;
+    const t0 = Date.now();
     waitLabel = { el: $('#typing-label'), n: 0, timer: setInterval(() => {
       if (!waitLabel || !waitLabel.el) { clearInterval(waitLabel && waitLabel.timer); return; }
-      waitLabel.n++;
-      waitLabel.el.textContent = waitLabel.n >= 3 ? '还在想，长问题要多琢磨一会儿…' : (waitLabel.n >= 1 ? '正在思考…' : '');
-    }, 4500) };
+      const sec = Math.round((Date.now() - t0) / 1000);
+      waitLabel.el.textContent = sec + 's · ' + (sec >= 12 ? '还在想，长问题要多琢磨一会儿…' : '正在思考…');
+    }, 1000) };
+    setWaitText('0s · 正在思考…');
   }
   function hideTyping() {
     const t = $('#msg-typing'); if (t) t.remove();
@@ -767,26 +946,45 @@ const Chat = (() => {
     if (!q || sending) return;
     sending = true;
     stopTypewriter(true);   // 上一条还在打字就先瞬间补全
-    $('#chat-send').disabled = true;
+    setSendMode(true);
+    /* 编辑重发：先截掉被编辑那条及其之后，再作为新提问发出 */
+    if (editIdx != null) { saveHist(hist().slice(0, editIdx)); editIdx = null; cancelEditBar(); }
     if (!o.noPushUser) pushMsg('user', q);
     Sessions.ensure();
     showTyping();
-    const ctx = hist().slice(-CTX_MAX).map(m => ({ role: m.role, content: m.content }));
+    stopCtl = new AbortController();
+    const all = hist();
+    const ctx = all.slice(-CTX_MAX).map(m => ({ role: m.role, content: m.content }));
+    /* 超出上下文窗口的早期内容压成问题清单，避免静默丢失 */
+    const dropped = all.slice(0, Math.max(0, all.length - CTX_MAX));
+    let earlier = '';
+    if (dropped.length) {
+      const qs = dropped.filter(m => m.role === 'user')
+        .map(m => String(m.content || '').replace(/\s+/g, ' ').slice(0, 50));
+      if (qs.length) earlier = qs.slice(-10).map(t => '- ' + t).join('\n');
+    }
     try {
       if (!State.s.syncCode) await Sync.ensureCode();
       if (!State.s.syncCode) throw Object.assign(new Error('网络不可用，稍后再试'), { silent: true });
       const kbHits = KB.search(q).map(e => ({ title: e.title, content: String(e.content).slice(0, 400) }));
       const j = await Sync.request('ai.chat', {
         messages: ctx, mem: String(Mem.get().profile || '').slice(0, 600), kb: kbHits,
-        rules: Rules.texts(),
+        rules: Rules.texts(), earlier,
         ...(State.s.model ? { model: State.s.model } : {}),
-      }, 120000);
+      }, 120000, {
+        signal: stopCtl.signal,
+        retries: 2,
+        onRetry: (n) => setWaitText('网络波动，正在重试（' + n + '/2）…'),
+      });
       hideTyping();
       const full = j.text || '（空回答）';
       const h = hist();
       h.push({ role: 'assistant', content: full, ts: now() });
       saveHist(h);
       startTypewriter(hist().length - 1, full);   // 用落盘（含截断）后的真实下标
+      announce('问史回答：' + full.slice(0, 80));
+      if (typeof j.left === 'number') { State.s.left = j.left; State.save(); }
+      if (j.model && State.s.model && j.model !== State.s.model) toast('所选模型不可用，已自动改用 ' + j.model, 3200);
       if (State.s.digestOn) digest(q, full).then(n => { if (n) toast('已提炼入库'); });
       // 轮次计数 + 每 20 轮自动复盘
       const mt = meta();
@@ -795,15 +993,18 @@ const Chat = (() => {
       if (mt.rounds % 20 === 0) reviewNow(true).catch(() => {});
     } catch (e) {
       hideTyping();
-      if (!e.silent) {
+      if (e.abortedByUser) {
+        toast('已停止生成');
+      } else if (!e.silent) {
         const msg = e.code === 'LIMIT' ? e.message : '回答失败：' + e.message;
         $('#chat-msgs').insertAdjacentHTML('beforeend', `
-          <div class="msg bot"><div class="bubble msg-err">${esc(msg)}<br><span style="color:var(--ink-3);font-size:12px">内容已保留，稍后可重试</span></div></div>`);
+          <div class="msg bot"><div class="bubble msg-err">${esc(msg)}<br><span class="err-hint">内容已保留，稍后可重试</span></div></div>`);
         $('#chat-msgs').scrollTop = 1e9;
       }
     } finally {
       sending = false;
-      $('#chat-send').disabled = false;
+      stopCtl = null;
+      setSendMode(false);
     }
   }
 
@@ -834,7 +1035,13 @@ const Chat = (() => {
         if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(input.value); input.value = ''; input.style.height = 'auto'; }
       });
     }
-    $('#chat-send').addEventListener('click', () => { send(input.value); input.value = ''; input.style.height = 'auto'; input.focus(); });
+    $('#chat-send').addEventListener('click', () => {
+      if (sending) { if (stopCtl) stopCtl.abort(); return; }   // 生成中 → 点击即停止
+      if (!input.value.trim()) return;
+      send(input.value); input.value = ''; input.style.height = 'auto'; input.focus();
+    });
+    const eb = $('#edit-bar-cancel');
+    if (eb) eb.addEventListener('click', cancelEdit);
     $('#chat-chips').addEventListener('click', (ev) => {
       const c = ev.target.closest('.chip');
       if (c && !c.hasAttribute('data-reason')) send(c.getAttribute('data-q'));
@@ -842,6 +1049,10 @@ const Chat = (() => {
 
     /* 评价条事件（委托）：点当前已选 = 取消；点另一个 = 切换；差评弹原因面板 */
     $('#chat-msgs').addEventListener('click', async (ev) => {
+      /* 打字中：点一下立即显示全文 */
+      if (typingState) { stopTypewriter(true); return; }
+      const ed = ev.target.closest('[data-edit]');
+      if (ed) { startEdit(Number(ed.getAttribute('data-edit'))); return; }
       const good = ev.target.closest('[data-fb="good"]');
       const bad = ev.target.closest('[data-fb="bad"]');
       if (good) { feedback(Number(good.getAttribute('data-idx')), 'good'); return; }
@@ -990,6 +1201,8 @@ const Me = (() => {
     $('#me-kb-on').checked = !!State.s.kbOn;
     $('#me-sync-on').checked = !!State.s.syncOn;
     $('#me-hist-count').textContent = Chat.hist().length + ' 条';
+    const lf = $('#me-left');
+    if (lf) lf.textContent = (typeof State.s.left === 'number') ? (State.s.left + ' 次') : '—';
     fillModelSelect();
     renderRules();
   }
@@ -1120,17 +1333,38 @@ const Me = (() => {
 
 /* ===== 历史对话面板 ===== */
 const SessPanel = (() => {
+  function filtered() {
+    const q = ($('#sess-search') ? $('#sess-search').value : '').trim().toLowerCase();
+    let list = Sessions.all().slice();
+    if (q) {
+      list = list.filter(s => {
+        const hay = (s.title || '') + ' ' + (s.msgs || []).map(m => String(m.content || '')).join(' ');
+        return hay.toLowerCase().includes(q);
+      });
+    }
+    return list.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.ts || 0) - (a.ts || 0));
+  }
   function render() {
-    const list = Sessions.all();
-    $('#sess-count').textContent = list.length + ' 个';
-    $('#sess-list').innerHTML = list.length
+    const total = Sessions.all();
+    const list = filtered();
+    const q = ($('#sess-search') ? $('#sess-search').value : '').trim();
+    const cnt = $('#sess-count');
+    if (cnt) cnt.textContent = q ? (list.length + '/' + total.length + ' 个') : (total.length + ' 个');
+    const wrap = $('#sess-list');
+    if (!wrap) return;
+    wrap.innerHTML = list.length
       ? list.map(s => `
         <div class="sess-item ${s.id === Sessions.curId() ? 'on' : ''}" data-sess="${esc(s.id)}">
-          <div class="sess-title">${esc(s.title || '新对话')}</div>
+          <div class="sess-title">${s.pinned ? '<span class="sess-pin">置顶</span>' : ''}${esc(s.title || '新对话')}</div>
           <div class="sess-meta">${(s.msgs || []).length} 条 · ${fmtTs(s.ts || 0)}</div>
-          <button class="kb-del" data-sess-del="${esc(s.id)}">删除</button>
+          <div class="sess-acts">
+            <button class="mini-btn" data-sess-pin="${esc(s.id)}">${s.pinned ? '取消置顶' : '置顶'}</button>
+            <button class="mini-btn" data-sess-rename="${esc(s.id)}">改名</button>
+            <button class="mini-btn" data-sess-export="${esc(s.id)}">导出</button>
+            <button class="mini-btn danger" data-sess-del="${esc(s.id)}">删除</button>
+          </div>
         </div>`).join('')
-      : '<div class="tip">还没有历史对话</div>';
+      : `<div class="tip">${q ? '没有匹配的对话' : '还没有历史对话'}</div>`;
   }
   function open() { render(); $('#modal-sess').classList.remove('hidden'); }
   function close() { $('#modal-sess').classList.add('hidden'); }
@@ -1146,6 +1380,10 @@ const SessPanel = (() => {
       Chat.renderMsgs();
       close();
     });
+    const srch = $('#sess-search');
+    if (srch) srch.addEventListener('input', render);
+    const scl = $('#modal-sess-close');
+    if (scl) scl.addEventListener('click', close);
     $('#sess-list').addEventListener('click', (ev) => {
       const del = ev.target.closest('[data-sess-del]');
       if (del) {
@@ -1154,6 +1392,40 @@ const SessPanel = (() => {
         Sessions.remove(del.getAttribute('data-sess-del'));
         render();
         Chat.renderMsgs();
+        return;
+      }
+      const pin = ev.target.closest('[data-sess-pin]');
+      if (pin) {
+        ev.stopPropagation();
+        const id = pin.getAttribute('data-sess-pin');
+        const s = Sessions.all().find(x => x.id === id);
+        Sessions.setPinned(id, !(s && s.pinned));
+        render();
+        return;
+      }
+      const rn = ev.target.closest('[data-sess-rename]');
+      if (rn) {
+        ev.stopPropagation();
+        const id = rn.getAttribute('data-sess-rename');
+        const s = Sessions.all().find(x => x.id === id);
+        const t = prompt('给这段对话起个名字：', (s && s.title) || '');
+        if (t == null) return;
+        Sessions.rename(id, t);
+        render();
+        return;
+      }
+      const ex = ev.target.closest('[data-sess-export]');
+      if (ex) {
+        ev.stopPropagation();
+        const r = Sessions.exportMd(ex.getAttribute('data-sess-export'));
+        if (!r) return;
+        const blob = new Blob([r.text], { type: 'text/markdown;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = r.name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        toast('已导出 ' + r.name);
         return;
       }
       const item = ev.target.closest('[data-sess]');
@@ -1165,7 +1437,7 @@ const SessPanel = (() => {
       }
     });
   }
-  return { bind, open, close };
+  return { bind, open, close, render };
 })();
 
 /* ===== 视图切换 ===== */
@@ -1227,8 +1499,29 @@ async function boot() {
   } catch (e) { /* 离线 */ }
   $('#modal-ver-ok').addEventListener('click', () => $('#modal-ver').classList.add('hidden'));
 
+  /* 弹窗点背景关闭 */
+  $$('.modal').forEach(m => m.addEventListener('click', (ev) => { if (ev.target === m) m.classList.add('hidden'); }));
+
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
+    navigator.serviceWorker.register('./sw.js').then((reg) => {
+      const showBar = () => {
+        const bar = $('#web-update-bar');
+        if (!bar || !bar.classList.contains('hidden')) return;
+        bar.classList.remove('hidden');
+        bar.textContent = '网页版有新版本，点此刷新';
+        bar.onclick = () => location.reload();
+      };
+      /* SW 是 stale-while-revalidate：发版后首次打开仍可能拿到旧版，故主动提示刷新 */
+      if (reg.waiting && navigator.serviceWorker.controller) showBar();
+      reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', () => {
+          if (nw.state === 'installed' && navigator.serviceWorker.controller) showBar();
+        });
+      });
+      setInterval(() => { reg.update().catch(() => {}); }, 30 * 60 * 1000);
+    }).catch(() => {});
   }
 }
 document.addEventListener('DOMContentLoaded', boot);
