@@ -144,6 +144,7 @@ const LS = {
   state: 'ws_state', hist: 'ws_hist', kb: 'ws_kb', mem: 'ws_mem',
   rules: 'ws_rules', meta: 'ws_meta',
   seenVer: 'ws_seen_ver', api: 'ws_api', models: 'ws_models_cache',
+  noStream: 'ws_nostream',   // 逃生开关：置 1 则永久退回非流式（不改代码即可回滚）
 };
 function loadLS(key, dft) {
   try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? dft : v; }
@@ -304,6 +305,16 @@ const Sessions = (() => {
 
 /* ===== 云端同步（照搬 vocab-flash 模式：裸 fetch + action 协议） ===== */
 const API_DEFAULT = 'https://qinfweihe1-d5gxpjjli9f8f238b.service.tcloudbase.com/wsapi';
+/* 流式接口（方案 A）：独立的 HTTP 云函数 wsstream，只承接 ai.chat 的 SSE 流式输出。
+   实测两个默认域名（service / 网关 app.<env>.<region>.app）都能路由本路径，
+   故默认与 API_DEFAULT 同域名，仅把 /wsapi 换成 /wsstream；自定义 api 时按同规则替换。 */
+const API_STREAM_DEFAULT = 'https://qinfweihe1-d5gxpjjli9f8f238b.service.tcloudbase.com/wsstream';
+function streamApiOf(base) {
+  const b = String(base || '').trim();
+  if (!b) return API_STREAM_DEFAULT;
+  if (/\/wsapi\/?$/.test(b)) return b.replace(/\/wsapi\/?$/, '/wsstream');
+  return b.replace(/\/+$/, '') + '/wsstream';
+}
 /* 云端只备份轻量数据；知识库(kb)只存本地（用户要求，云端容量有限），靠导出文件迁移 */
 /* 云同步数据域。kb（知识库）原先只存本地，但重装/换机必丢且体量最大，故已并入云备份。
    改动需与服务端 wsapi/index.js 的 DOMAINS 保持一致。 */
@@ -312,6 +323,7 @@ const PUSH_DELAY = 30 * 1000;
 
 const Sync = (() => {
   const api = () => (localStorage.getItem(LS.api) || API_DEFAULT).trim() || API_DEFAULT;
+  const streamApi = () => streamApiOf(api());
 
   async function rawRequest(action, payload, timeoutMs, externalSignal) {
     const body = { action, code: State.s.syncCode || '', ...(payload || {}) };
@@ -381,6 +393,86 @@ const Sync = (() => {
       }
     }
     throw lastErr;
+  }
+
+  /* ---- 流式 ai.chat（方案 A）----
+     与 request 的差异：这里是「边收边用」，不能等整包；也不做自动重试——
+     流式一旦开始吐字，重试会导致内容重复。调用方需自行决定降级策略。
+     事件协议（服务端定义）：
+       {"type":"start","model":..} / {"type":"delta","text":..} /
+       {"type":"end","left":..,"model":..,"chars":..} / {"type":"error","error":..,"message":..}
+     抛出：e.noStream=true 表示环境不支持流式读（调用方应永久降级）；
+           e.code 为业务错误码（与 wsapi 契约一致）；e.abortedByUser 为用户点了停止。 */
+  async function streamChat(payload, opts) {
+    const o = opts || {};
+    const body = { action: 'ai.chat', code: State.s.syncCode || '', ...(payload || {}) };
+    let res;
+    try {
+      res = await fetch(streamApi(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: o.signal,
+      });
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        const err = new Error('已停止'); err.abortedByUser = true; throw err;
+      }
+      const err = new Error('网络不可用：' + ((e && e.message) || '连接失败'));
+      err.network = true; throw err;
+    }
+    const ct = String((res.headers && res.headers.get && res.headers.get('content-type')) || '');
+    if (!res.ok || ct.indexOf('text/event-stream') < 0) {
+      /* 前置错误（未开始流式）：服务端返回普通 JSON，错误码契约与 wsapi 一致 */
+      let j = null; try { j = await res.json(); } catch (e) { /* 非 JSON */ }
+      const err = new Error((j && j.message) || ('HTTP ' + res.status));
+      err.code = j && j.error;
+      err.status = res.status;
+      err.network = res.status >= 500;
+      throw err;
+    }
+    if (!res.body || typeof res.body.getReader !== 'function' || typeof TextDecoder === 'undefined') {
+      const err = new Error('当前环境不支持流式读取'); err.noStream = true; throw err;
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder('utf-8');
+    let buf = '', text = '', model = '', left = null, evErr = null;
+    for (;;) {
+      let chunk;
+      try { chunk = await reader.read(); }
+      catch (e) {
+        if (o.signal && o.signal.aborted) { const err = new Error('已停止'); err.abortedByUser = true; throw err; }
+        throw e;
+      }
+      if (chunk.done) break;
+      buf += dec.decode(chunk.value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, '');
+        buf = buf.slice(nl + 1);
+        if (line.slice(0, 6) !== 'data: ') continue;
+        const s = line.slice(6).trim();
+        if (!s) continue;
+        let ev = null; try { ev = JSON.parse(s); } catch (e) { continue; }
+        if (ev.type === 'delta' && ev.text) {
+          text += ev.text;
+          if (o.onDelta) o.onDelta(ev.text);
+        } else if (ev.type === 'start') {
+          model = ev.model || '';
+        } else if (ev.type === 'end') {
+          if (ev.model) model = ev.model;
+          if (typeof ev.left === 'number') left = ev.left;
+        } else if (ev.type === 'error') {
+          evErr = ev;
+        }
+      }
+    }
+    if (evErr && !text) {
+      const err = new Error(evErr.message || '流式中断');
+      err.code = evErr.error || 'AI_UPSTREAM';
+      throw err;
+    }
+    return { text, left, model, partial: !!evErr };
   }
 
   /* 域数据快照 */
@@ -582,7 +674,7 @@ const Sync = (() => {
     }
   }
 
-  return { request, markDirty, pushAll, restore, ensureCode, init, setSyncState };
+  return { request, streamChat, markDirty, pushAll, restore, ensureCode, init, setSyncState };
 })();
 
 /* ===== 口令式同步码 =====
@@ -984,6 +1076,8 @@ const Chat = (() => {
   /* ---- 打字机状态：{idx, shown}，renderMsgs 按 shown 截断显示 ---- */
   let typingState = null;
   let typingTimer = null;
+  /* ---- 流式状态：正在逐字写入的回答下标（-1 表示无）。仅用于在流式期间隐藏操作条 ---- */
+  let streamingIdx = -1;
   function stopTypewriter(finish) {
     if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
     if (finish && typingState) {
@@ -1025,9 +1119,33 @@ const Chat = (() => {
     }, tick);
   }
 
+  /* ---- 流式渲染：首块到达时开一个空气泡，之后只改这一个元素的 innerHTML ----
+     与打字机的区别：打字机是「已有全文、假装慢慢打」；这里是真实边收边写。
+     全量 renderMsgs() 在流式期间不能每条都调（几十次重排会卡），故只原地更新气泡。 */
+  function beginLiveBubble() {
+    const h = hist();
+    h.push({ role: 'assistant', content: '', ts: now() });
+    saveHist(h);
+    renderMsgs();
+    const idx = hist().length - 1;     // 落盘可能截断，取落盘后的真实下标
+    streamingIdx = idx;
+    return idx;
+  }
+  function pushLive(idx, allText) {
+    const h = hist();
+    if (h[idx]) h[idx].content = allText;   // 只改缓存，不落盘（避免每条增量都写 localStorage）
+    const b = bubbleEl(idx);
+    if (b) b.innerHTML = mdLite(allText) + '<span class="caret"></span>';
+    const wrap = $('#chat-msgs');
+    /* 只在用户本来就贴着底部时才跟随，避免打断上翻历史（与打字机同策略） */
+    if (wrap && wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 140) wrap.scrollTop = wrap.scrollHeight;
+  }
+  function endLiveBubble() { streamingIdx = -1; }
+
   function fbBarHtml(idx, m) {
     if (m.role !== 'assistant') return '';
     if (typingState && typingState.idx === idx) return ''; // 打字中不显示操作条
+    if (streamingIdx === idx) return '';                   // 流式写入中同理
     const fb = m.fb || {};
     const isLast = idx === hist().length - 1;
     const hint = (fb.v === 'bad')
@@ -1227,28 +1345,80 @@ const Chat = (() => {
         .map(m => String(m.content || '').replace(/\s+/g, ' ').slice(0, 50));
       if (qs.length) earlier = qs.slice(-10).map(t => '- ' + t).join('\n');
     }
+    let full = '', usedModel = '', leftN = null;
+    let liveIdx = -1, gotAny = false, streamed = false, finished = false;
     try {
       if (!State.s.syncCode) await Sync.ensureCode();
       if (!State.s.syncCode) throw Object.assign(new Error('网络不可用，稍后再试'), { silent: true });
       const kbHits = KB.search(q).map(e => ({ title: e.title, content: String(e.content).slice(0, 400) }));
-      const j = await Sync.request('ai.chat', {
+      const payload = {
         messages: ctx, mem: String(Mem.get().profile || '').slice(0, 600), kb: kbHits,
         rules: Rules.texts(), earlier,
         ...(State.s.model ? { model: State.s.model } : {}),
-      }, 120000, {
-        signal: stopCtl.signal,
-        retries: 2,
-        onRetry: (n) => setWaitText('网络波动，正在重试（' + n + '/2）…'),
-      });
+      };
+
+      /* ---- 优先走流式（方案 A）；凡是「尚未吐字」的失败都静默降级到原非流式路径 ----
+         ws_nostream=1 可永久退回非流式（不改代码的逃生开关） */
+      if (!loadLS(LS.noStream, false)) {
+        try {
+          const r = await Sync.streamChat(payload, {
+            signal: stopCtl.signal,
+            onDelta: (piece) => {
+              if (!gotAny) { gotAny = true; hideTyping(); liveIdx = beginLiveBubble(); }
+              full += piece;
+              pushLive(liveIdx, full);
+            },
+          });
+          if (!full) full = r.text || '';
+          usedModel = r.model || '';
+          if (typeof r.left === 'number') leftN = r.left;
+          streamed = true; finished = true;
+          if (r.partial) toast('回答被中途截断，已保留已生成部分', 3200);
+        } catch (e) {
+          if (e && e.noStream) {
+            saveLS(LS.noStream, true);              // 环境不支持流式读：以后直接走非流式
+          } else if (e && e.abortedByUser) {
+            if (gotAny) { streamed = true; finished = true; }   // 点「停止生成」→ 保留已生成的部分
+            else throw e;
+          } else if (gotAny) {
+            streamed = true; finished = true;        // 已吐字后断流：保留半截，不重试（重试会重复内容）
+            toast('网络中断，已保留已生成的内容', 3200);
+          } else if (e && e.code) {
+            throw e;                                 // 业务错误（LIMIT/AI_AUTH/BAD_CODE…）原样上报
+          }
+          /* 其余（连接失败等，尚未吐字）：落到下面走非流式 */
+        }
+      }
+
+      if (!finished) {
+        const j = await Sync.request('ai.chat', payload, 120000, {
+          signal: stopCtl.signal,
+          retries: 2,
+          onRetry: (n) => setWaitText('网络波动，正在重试（' + n + '/2）…'),
+        });
+        full = j.text || '（空回答）';
+        usedModel = j.model || '';
+        if (typeof j.left === 'number') leftN = j.left;
+      }
+
       hideTyping();
-      const full = j.text || '（空回答）';
-      const h = hist();
-      h.push({ role: 'assistant', content: full, ts: now() });
-      saveHist(h);
-      startTypewriter(hist().length - 1, full);   // 用落盘（含截断）后的真实下标
+      if (streamed) {
+        if (!full) full = '（空回答）';
+        endLiveBubble();
+        const h2 = hist();                       // 落盘可能截断下标，故以活体下标为准并对齐
+        if (h2[liveIdx]) h2[liveIdx].content = full;
+        else h2.push({ role: 'assistant', content: full, ts: now() });
+        saveHist(h2);
+        renderMsgs();                            // 补上流式期间被隐藏的评价条
+      } else {
+        const h = hist();
+        h.push({ role: 'assistant', content: full, ts: now() });
+        saveHist(h);
+        startTypewriter(hist().length - 1, full);   // 用落盘（含截断）后的真实下标
+      }
       announce('问史回答：' + full.slice(0, 80));
-      if (typeof j.left === 'number') { State.s.left = j.left; State.save(); }
-      if (j.model && State.s.model && j.model !== State.s.model) toast('所选模型不可用，已自动改用 ' + j.model, 3200);
+      if (typeof leftN === 'number') { State.s.left = leftN; State.save(); }
+      if (usedModel && State.s.model && usedModel !== State.s.model) toast('所选模型不可用，已自动改用 ' + usedModel, 3200);
       if (State.s.digestOn) digest(q, full).then(n => { if (n) toast('已提炼入库'); });
       // 轮次计数 + 每 20 轮自动复盘
       const mt = meta();
@@ -1257,6 +1427,7 @@ const Chat = (() => {
       if (mt.rounds % 20 === 0) reviewNow(true).catch(() => {});
     } catch (e) {
       hideTyping();
+      endLiveBubble();
       if (e.abortedByUser) {
         toast('已停止生成');
       } else if (!e.silent) {
@@ -1266,6 +1437,7 @@ const Chat = (() => {
         $('#chat-msgs').scrollTop = 1e9;
       }
     } finally {
+      streamingIdx = -1;
       sending = false;
       stopCtl = null;
       setSendMode(false);
