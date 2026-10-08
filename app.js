@@ -160,10 +160,20 @@ function saveLS(key, v) {
 
 const State = {
   s: loadLS(LS.state, null) || {
-    syncCode: '', syncOn: true, model: '', digestOn: true, kbOn: true, curSession: '', pwMode: false,
+    syncCode: '', syncOn: true, model: '', digestOn: true, kbOn: true, rememberOn: true,
+    curSession: '', pwMode: false,
   },
   save() { saveLS(LS.state, this.s); },
 };
+
+/* 新增状态字段的补全（老用户的 state 里没有这些键，只在内存里补是隐性的）
+   为什么必须落地：所有判断都写 `!== false`，行为上等价于 true，但字段本身是 undefined 会被
+   原样带进 settings 域同步（JSON.stringify 直接丢键），留下一个长期悬空的字段；
+   日后谁写 `if (State.s.rememberOn)` 就会踩坑。
+   只增键、绝不删改任何已有值；已是最新格式时不会触发写入。
+   2026-10-08 由 upgradeprobe.cjs 实测发现。 */
+if (!State.s || typeof State.s !== 'object') State.s = {};
+if (typeof State.s.rememberOn !== 'boolean') { State.s.rememberOn = true; State.save(); }
 
 /* ---- 一次性迁移：旧的单聊天记录 → 多会话结构 ---- */
 (function migrateHist() {
@@ -495,8 +505,8 @@ const Sync = (() => {
     if (domain === 'mem') return loadLS(LS.mem, { profile: '', ts: 0 });
     if (domain === 'rules') return loadLS(LS.rules, []);
     if (domain === 'settings') {
-      const { model, digestOn, kbOn } = State.s;
-      return { model, digestOn, kbOn, ts: now() };
+      const { model, digestOn, kbOn, rememberOn } = State.s;
+      return { model, digestOn, kbOn, rememberOn, ts: now() };
     }
     return null;
   }
@@ -616,6 +626,7 @@ const Sync = (() => {
       if (cloud && cloud.model && !State.s.model) State.s.model = cloud.model;
       if (typeof cloud.digestOn === 'boolean') State.s.digestOn = cloud.digestOn;
       if (typeof cloud.kbOn === 'boolean') State.s.kbOn = cloud.kbOn;
+      if (typeof cloud.rememberOn === 'boolean') State.s.rememberOn = cloud.rememberOn;
       State.save();
       return true;
     }
@@ -1310,6 +1321,28 @@ const Chat = (() => {
     }
   }
 
+  /* 长期记忆入库（S2 写入侧，2026-10-08）
+     与 digest 并行、互不影响：digest 管「知识库 + 用户画像」，这里管「结构化事实图谱」。
+     三条纪律（改动前请先读）：
+       1. 纯附加 —— 只往云端记忆库写，**从不碰本地任何数据**；失败静默，绝不影响聊天。
+       2. 不堆积 —— 上一轮还没跑完就跳过本轮（抽取实测 10~25s，慢网络下更长）。
+       3. 长回答才值得一次抽取 —— 寒暄/确认类短回答跳过，省掉无谓的调用与额度。
+     出问题时的开关：「我的 → 长期记忆入库」关掉即可（不需要发版）。 */
+  let rememberBusy = false, rememberFail = 0;
+  async function remember(q, a) {
+    if (rememberBusy) return 0;
+    rememberBusy = true;
+    try {
+      const j = await Sync.request('ai.remember', { q, a, mem: Mem.get().profile }, 125000);
+      rememberFail = 0;
+      return (j && j.ing) ? 1 : 0;
+    } catch (e) {
+      rememberFail++;
+      if (rememberFail >= 3) { rememberFail = 0; toast('记忆入库连续失败，稍后自动重试', 4000); }
+      return 0;
+    } finally { rememberBusy = false; }
+  }
+
   /* 复盘：AI 重写整套法则（每 20 轮自动 / 设置页手动） */
   async function reviewNow(auto) {
     const recent = hist().slice(-10)
@@ -1420,6 +1453,9 @@ const Chat = (() => {
       if (typeof leftN === 'number') { State.s.left = leftN; State.save(); }
       if (usedModel && State.s.model && usedModel !== State.s.model) toast('所选模型不可用，已自动改用 ' + usedModel, 3200);
       if (State.s.digestOn) digest(q, full).then(n => { if (n) toast('已提炼入库'); });
+      /* 长期记忆入库：与上面并行、不 await（不拖慢界面），短回答跳过。
+         写的是云端记忆库，与本地会话/KB/法则完全隔离 —— 失败也不影响任何已有数据。 */
+      if (State.s.rememberOn !== false && full.length >= 40) remember(q, full);
       // 轮次计数 + 每 20 轮自动复盘
       const mt = meta();
       mt.rounds = (mt.rounds || 0) + 1;
@@ -1594,7 +1630,7 @@ const Me = (() => {
       kb: loadLS(LS.kb, []),
       mem: loadLS(LS.mem, { profile: '', ts: 0 }),
       rules: loadLS(LS.rules, []), meta: loadLS(LS.meta, { rounds: 0 }),
-      settings: { model: State.s.model, digestOn: State.s.digestOn, kbOn: State.s.kbOn },
+      settings: { model: State.s.model, digestOn: State.s.digestOn, kbOn: State.s.kbOn, rememberOn: State.s.rememberOn !== false },
       /* 一并带上云同步身份，这样「导出文件 → 重装 → 导入文件」能把云端身份也找回来 */
       syncCode: State.s.syncCode || '', syncOn: !!State.s.syncOn,
     };
@@ -1646,6 +1682,7 @@ const Me = (() => {
       if (j.settings.model) { State.s.model = j.settings.model; }
       if (typeof j.settings.digestOn === 'boolean') State.s.digestOn = j.settings.digestOn;
       if (typeof j.settings.kbOn === 'boolean') State.s.kbOn = j.settings.kbOn;
+      if (typeof j.settings.rememberOn === 'boolean') State.s.rememberOn = j.settings.rememberOn;
       State.save();
     }
     /* 备份里带着云同步身份（同步码）时一并采用 —— 仅当本地还没有码，避免覆盖当前身份。
@@ -1666,6 +1703,10 @@ const Me = (() => {
   function fillSettings() {
     $('#me-digest-on').checked = !!State.s.digestOn;
     $('#me-kb-on').checked = !!State.s.kbOn;
+    /* 取值前判空：万一遇到「新 app.js + 旧 index.html」的错配（缓存/半更新），
+       裸取 .checked 会抛错并中断整个初始化 —— 那在用户眼里就等同「App 坏了/数据没了」。 */
+    const rEl = $('#me-remember-on');
+    if (rEl) rEl.checked = State.s.rememberOn !== false;
     $('#me-sync-on').checked = !!State.s.syncOn;
     $('#me-hist-count').textContent = Chat.hist().length + ' 条';
     const lf = $('#me-left');
@@ -1787,6 +1828,8 @@ const Me = (() => {
     $('#me-models-refresh').addEventListener('click', () => refreshModels(false));
     $('#me-digest-on').addEventListener('change', (ev) => { State.s.digestOn = ev.target.checked; State.save(); Sync.markDirty('settings'); });
     $('#me-kb-on').addEventListener('change', (ev) => { State.s.kbOn = ev.target.checked; State.save(); Sync.markDirty('settings'); });
+    const rSw = $('#me-remember-on');
+    if (rSw) rSw.addEventListener('change', (ev) => { State.s.rememberOn = ev.target.checked; State.save(); Sync.markDirty('settings'); });
     $('#me-hist-clear').addEventListener('click', () => {
       if (!confirm('清空全部对话记录？此操作不可撤销（云端备份也会在下次同步时覆盖）')) return;
       Sessions.clearAll();
