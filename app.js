@@ -145,6 +145,7 @@ const LS = {
   rules: 'ws_rules', meta: 'ws_meta',
   seenVer: 'ws_seen_ver', api: 'ws_api', models: 'ws_models_cache',
   noStream: 'ws_nostream',   // 逃生开关：置 1 则永久退回非流式（不改代码即可回滚）
+  nosum: 'ws_nosum',         // 逃生开关：置 1 则关闭 S3 滚动摘要（earlier 退回旧问题清单）
 };
 function loadLS(key, dft) {
   try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? dft : v; }
@@ -310,7 +311,18 @@ const Sessions = (() => {
     if (n) saveAll(list);
     return n;
   }
-  return { all, cur, curMsgs, ensure, put, switchTo, remove, newOne, clearAll, curId, invalidate, rename, setPinned, exportMd, migrateTitles };
+  /* S3：写入/清除某会话的滚动摘要。**按 id 定位**——压缩是异步的，await 期间
+     用户可能已经切了会话；只动 sum 一个字段，messages/标题/置顶一概不碰。 */
+  function setSum(id, sum) {
+    if (!id) return false;
+    const list = all();
+    const i = list.findIndex(s => s.id === id);
+    if (i < 0) return false;
+    if (sum) list[i].sum = sum; else delete list[i].sum;
+    saveAll(list);
+    return true;
+  }
+  return { all, cur, curMsgs, ensure, put, switchTo, remove, newOne, clearAll, curId, invalidate, rename, setPinned, exportMd, migrateTitles, setSum };
 })();
 
 /* ===== 云端同步（照搬 vocab-flash 模式：裸 fetch + action 协议） ===== */
@@ -1046,6 +1058,10 @@ const Chat = (() => {
   let stopCtl = null;       // 当前请求的中断句柄（停止生成）
   let editIdx = null;       // 正在编辑重发的消息下标
   const HIST_MAX = 120, CTX_MAX = 12;
+  /* S3 滚动摘要：超出上下文窗口的早期对话压成摘要注入 earlier（原先只取用户提问、截 50 字，
+     助手侧的关键结论会整段丢失）。SUM_STEP = 被丢弃段新增多少条才压一次；
+     SUM_TEXT_MAX = 摘要目标长度，与服务端 earlier 槽位（1200 字）留出余量。 */
+  const SUM_STEP = 6, SUM_TEXT_MAX = 900;
   const REASONS = ['太浅了', '大俗话', '太理论', '例子不好', '立场偏了', '太长'];
 
   /* 无障碍：只播报最新一条回答，避免整块重渲染被反复朗读 */
@@ -1329,6 +1345,7 @@ const Chat = (() => {
        3. 长回答才值得一次抽取 —— 寒暄/确认类短回答跳过，省掉无谓的调用与额度。
      出问题时的开关：「我的 → 长期记忆入库」关掉即可（不需要发版）。 */
   let rememberBusy = false, rememberFail = 0;
+  let sumBusy = false;                 // S3 摘要压缩的并发闸门
   async function remember(q, a) {
     if (rememberBusy) return 0;
     rememberBusy = true;
@@ -1341,6 +1358,54 @@ const Chat = (() => {
       if (rememberFail >= 3) { rememberFail = 0; toast('记忆入库连续失败，稍后自动重试', 4000); }
       return 0;
     } finally { rememberBusy = false; }
+  }
+
+  /* ---- S3 上下文滚动摘要 ----
+     超出上下文窗口的早期对话，压成一份滚动摘要随 earlier 注入；替代原先
+     「只取用户提问、截 50 字、最多 10 条」的粗暴折叠（助手侧的关键结论会整段丢失）。
+     摘要存在**会话对象**的 sum 字段 {upto,text,src,ts}，随 hist 域云同步 ——
+     不写云端记忆库、不碰本地其他任何键；ws_nosum=1 可永久退回旧行为（不改代码的逃生开关）。 */
+  function noSum() {
+    const v = loadLS(LS.nosum, false);
+    return v === true || v === 1 || v === '1';
+  }
+  /* 取当前会话可用的摘要。src = 压缩当时的历史条数：若之后历史被「编辑重发」回退过
+     （all.length < src），说明消息已不是摘要所依据的那份 → 作废、从头再压。 */
+  function curSummary(all) {
+    const s = Sessions.cur();
+    const sum = s && s.sum;
+    if (!sum || !sum.text) return null;
+    if (typeof sum.upto !== 'number' || typeof sum.src !== 'number') return null;
+    if (sum.src > all.length || sum.upto > all.length) return null;
+    return sum;
+  }
+  async function compact() {
+    if (noSum() || sumBusy) return 0;
+    const all = hist();
+    const over = all.length - CTX_MAX;
+    if (over <= 0) return 0;
+    const prev = curSummary(all);
+    const covered = prev ? prev.upto : 0;
+    const add = all.slice(0, over).slice(covered);      // 只压「新落入被丢弃区」的那段
+    if (add.length < SUM_STEP) return 0;
+    const sessId = Sessions.curId();                    // ★ 先取 id：await 期间用户可能切会话
+    const srcLen = all.length, upto = over;
+    sumBusy = true;
+    try {
+      const j = await Sync.request('ai.compact', {
+        prev: prev ? String(prev.text) : '',
+        turns: add.map((m) => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: String(m.content || '').slice(0, 600),
+        })),
+      }, 90000);
+      const text = j && j.summary ? String(j.summary).trim().slice(0, SUM_TEXT_MAX) : '';
+      if (!text) return 0;
+      Sessions.setSum(sessId, { upto, text, src: srcLen, ts: now() });
+      return 1;
+    } catch (e) {
+      return 0;   // 静默：摘要拿不到就继续用旧内容，下一轮再试
+    } finally { sumBusy = false; }
   }
 
   /* 复盘：AI 重写整套法则（每 20 轮自动 / 设置页手动） */
@@ -1370,13 +1435,19 @@ const Chat = (() => {
     stopCtl = new AbortController();
     const all = hist();
     const ctx = all.slice(-CTX_MAX).map(m => ({ role: m.role, content: m.content }));
-    /* 超出上下文窗口的早期内容压成问题清单，避免静默丢失 */
+    /* 超出上下文窗口的早期内容：优先用 S3 滚动摘要；没有摘要（老会话/压缩失败/被关掉）
+       才回退旧「问题清单」。两条路都只往 earlier 里放文字，不改变发送的消息本身。 */
     const dropped = all.slice(0, Math.max(0, all.length - CTX_MAX));
     let earlier = '';
     if (dropped.length) {
-      const qs = dropped.filter(m => m.role === 'user')
-        .map(m => String(m.content || '').replace(/\s+/g, ' ').slice(0, 50));
-      if (qs.length) earlier = qs.slice(-10).map(t => '- ' + t).join('\n');
+      const sum = noSum() ? null : curSummary(all);
+      if (sum && sum.text) {
+        earlier = String(sum.text).slice(0, 1200);
+      } else {
+        const qs = dropped.filter(m => m.role === 'user')
+          .map(m => String(m.content || '').replace(/\s+/g, ' ').slice(0, 50));
+        if (qs.length) earlier = qs.slice(-10).map(t => '- ' + t).join('\n');
+      }
     }
     let full = '', usedModel = '', leftN = null;
     let liveIdx = -1, gotAny = false, streamed = false, finished = false;
@@ -1456,6 +1527,8 @@ const Chat = (() => {
       /* 长期记忆入库：与上面并行、不 await（不拖慢界面），短回答跳过。
          写的是云端记忆库，与本地会话/KB/法则完全隔离 —— 失败也不影响任何已有数据。 */
       if (State.s.rememberOn !== false && full.length >= 40) remember(q, full);
+      /* S3：早期对话滚动摘要（同样不 await；失败静默，下一轮再试） */
+      compact().catch(() => {});
       // 轮次计数 + 每 20 轮自动复盘
       const mt = meta();
       mt.rounds = (mt.rounds || 0) + 1;
