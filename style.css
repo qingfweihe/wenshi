@@ -148,9 +148,10 @@ body {
   overflow-x: auto; margin: 8px 0; border: 1px solid var(--pink-line);
   border-radius: 10px; -webkit-overflow-scrolling: touch;
 }
-.bubble .md-tbl { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+.bubble .md-tbl { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 13.5px; }
 .bubble .md-tbl th, .bubble .md-tbl td {
   padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--pink-line); vertical-align: top;
+  max-width: 58vw; word-break: break-word;
 }
 .bubble .md-tbl th { background: var(--pink-soft); font-weight: 700; white-space: nowrap; }
 .bubble .md-tbl tbody tr:last-child td { border-bottom: 0; }
