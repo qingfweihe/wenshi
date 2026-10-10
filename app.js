@@ -355,6 +355,17 @@ const DOMAIN_CHAR_CAP = 240 * 1024;
 const DOMAIN_BYTE_CAP = 3 * 1024 * 1024;
 const DOMAIN_BYTE_CAP_SAFE = 96 * 1024;   // 比 102400 留 4KB 给信封，退回 json 也安全
 
+/* ---- B 项：hist 分片存储 ----
+   hist 会随对话增长顶爆单域上限（256K 字符）→ 超了就改为「按会话分片」：
+   清单 `hist` 只存 { sharded:true, ids:[...], cur }（几百字节），每个会话单独一片
+   `hist#<会话id>`。服务端 expandSharded() 读取时自动拼回 { sessions, cur }，
+   所以读取侧（merge/restore）一行都不用改，旧平铺数据也照常读。
+   平铺阈值取 180K 字符：能塞下就平铺（兼容 + 只发一个请求），塞不下才分片。 */
+const HIST_FLAT_CHAR_CAP = 180 * 1024;
+const HIST_FLAT_BYTE_CAP = 1.5 * 1024 * 1024;
+const SHARD_CHAR_CAP = 200 * 1024;        // 单会话分片上限（服务端单文件 256K 字符）
+const SHARD_BYTE_CAP = 1.5 * 1024 * 1024;
+
 /* UTF-8 字节数。TextEncoder 优先；老环境手算兜底（中文 3 字节、代理对 4 字节）。 */
 function utf8Len(s) {
   if (typeof TextEncoder !== 'undefined') {
@@ -558,37 +569,42 @@ const Sync = (() => {
     const maxBytes = o.maxBytes || DOMAIN_BYTE_CAP;
 
     if (domain === 'hist') {
-      /* 会话按「新→旧」装箱，装不下的旧会话**只留在本地**。
-         merge 是并集、导出备份也不受影响，所以「少传」不会删掉任何东西。 */
-      const all = loadLS('ws_sessions', []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      /* 会话按「新→旧」，最多 30 条（与 merge 的并集上限一致）。
+         能平铺塞下就平铺；塞不下改为分片（每会话一片）—— 这样**任何一条会话都不会被丢**，
+         而旧实现是「装不下的旧会话直接不上云」。 */
+      const all = loadLS('ws_sessions', []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 30);
       const cur = Sessions.curId();
-      const base = JSON.stringify({ sessions: [], cur });
-      let chars = base.length, bytes = utf8Len(base);
-      const out = [];
-      let truncated = false;
-      for (const sess of all) {
+
+      const flatS = JSON.stringify({ sessions: all, cur });
+      if (all.length && flatS.length <= HIST_FLAT_CHAR_CAP && utf8Len(flatS) <= HIST_FLAT_BYTE_CAP) {
+        return { mode: 'flat', data: { sessions: all, cur }, s: flatS, bytes: utf8Len(flatS), truncated: false, shards: [] };
+      }
+
+      /* 单会话若自己就超预算：只留它最近若干条消息（更早内容在 S3 滚动摘要里，不会全丢） */
+      const trimSess = (sess) => {
         const one = JSON.stringify(sess);
-        const c = one.length + (out.length ? 1 : 0);      // 数组元素间的逗号
-        const b = utf8Len(one) + (out.length ? 1 : 0);
-        if (chars + c > maxChars || bytes + b > maxBytes) { truncated = true; break; }
-        out.push(sess); chars += c; bytes += b;
-      }
-      /* 连最新一条都装不下（单会话体量过大）：只留它最近几条消息。
-         更早的内容本来就在 S3 滚动摘要里，不会全丢。 */
-      if (!out.length && all.length) {
-        const first = all[0];
-        const msgs = Array.isArray(first.msgs) ? first.msgs : [];
+        if (one.length <= SHARD_CHAR_CAP && utf8Len(one) <= SHARD_BYTE_CAP) return { sess, trimmed: false };
+        const msgs = Array.isArray(sess.msgs) ? sess.msgs : [];
         let keep = 0;
-        for (let n = msgs.length; n >= 1; n--) {
-          const t = JSON.stringify({ sessions: [{ ...first, msgs: msgs.slice(-n) }], cur });
-          if (t.length <= maxChars && utf8Len(t) <= maxBytes) { keep = n; break; }
+        for (let n = msgs.length; n >= 0; n--) {
+          const t = JSON.stringify({ ...sess, msgs: msgs.slice(-n) });
+          if (t.length <= SHARD_CHAR_CAP && utf8Len(t) <= SHARD_BYTE_CAP) { keep = n; break; }
         }
-        out.push({ ...first, msgs: msgs.slice(-keep) });
-        truncated = true;
+        return { sess: { ...sess, msgs: msgs.slice(-keep) }, trimmed: true };
+      };
+      /* 分片名须满足服务端 ^[A-Za-z0-9_-]{1,80}$；会话 id 一般合规，异常字符统一转 _ */
+      const safeId = (id) => String(id).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80) || 'x';
+
+      const shards = [];
+      let truncated = false;
+      for (const s0 of all) {
+        const { sess, trimmed } = trimSess(s0);
+        if (trimmed) truncated = true;
+        shards.push({ id: safeId(sess.id), data: sess, s: JSON.stringify(sess) });
       }
-      const data = { sessions: out, cur };
-      const s = JSON.stringify(data);
-      return { data, s, bytes: utf8Len(s), truncated };
+      const manifest = { sharded: true, ids: shards.map((x) => x.id), cur };
+      const ms = JSON.stringify(manifest);
+      return { mode: 'sharded', data: manifest, s: ms, bytes: utf8Len(ms), truncated, shards };
     }
 
     if (domain === 'kb') {
@@ -640,6 +656,7 @@ const Sync = (() => {
   }
 
   const hashes = loadLS('ws_sync_hashes', {});
+  const shardHashes = loadLS('ws_sync_shard_hashes', {});   // 分片级比对：没变的片不重发
   const dirty = new Set();
   let pushTimer = null, pushing = false, lastState = '', lastErr = '';
 
@@ -671,6 +688,16 @@ const Sync = (() => {
         try {
           let pack = snapshot(d);
           if (!force && hashes[d] === djb2(pack.s)) { dirty.delete(d); continue; }
+          /* B 项：hist 分片时，先逐片上传（跳过未变的），最后才写清单 ——
+             顺序反过来会出现「清单已指向一个还没写上的片」。 */
+          if (d === 'hist' && pack.mode === 'sharded') {
+            for (const sh of pack.shards) {
+              const h = djb2(sh.s);
+              if (!force && shardHashes[sh.id] === h) continue;
+              await request('state.put', { domain: 'hist#' + sh.id, data: sh.data });
+              shardHashes[sh.id] = h;
+            }
+          }
           try {
             await request('state.put', { domain: d, data: pack.data });
           } catch (e) {
@@ -695,6 +722,7 @@ const Sync = (() => {
         }
       }
       saveLS('ws_sync_hashes', hashes);
+      saveLS('ws_sync_shard_hashes', shardHashes);
       if (failed.length) {
         lastErr = firstErr;
         setSyncState('备份未完成：' + firstErr
