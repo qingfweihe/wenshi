@@ -721,15 +721,19 @@ const Sync = (() => {
     if (domain === 'kb') {
       const local = loadLS(LS.kb, []);
       const map = new Map(local.map(e => [e.id, e]));
-      let added = 0;
+      let added = 0, updated = 0;
       for (const e of (cloud || [])) {
         const old = map.get(e.id);
-        if (!old) added++;
-        if (!old || (e.ts || 0) >= (old.ts || 0)) map.set(e.id, e);
+        if (!old) { added++; map.set(e.id, e); continue; }
+        if ((e.ts || 0) >= (old.ts || 0)) {
+          if (JSON.stringify(old) !== JSON.stringify(e)) updated++;   // 同 id 内容变新也算「有变化」
+          map.set(e.id, e);
+        }
       }
       const merged = Array.from(map.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 500);
-      saveLS(LS.kb, merged);
-      return { changed: added > 0, added };
+      /* 写盘失败（本地存储满）绝不能算成功 —— 否则界面报「新增 N」，实际一条没落盘 */
+      if (!saveLS(LS.kb, merged)) return { changed: false, added: 0, saveFailed: true };
+      return { changed: (added + updated) > 0, added, updated };
     }
     if (domain === 'hist') {
       /* 兼容两种云端格式：
@@ -748,11 +752,11 @@ const Sync = (() => {
       if (!cloudSessions || !cloudSessions.length) return NONE;
       const local = loadLS('ws_sessions', []);
       if (!local.length) {
-        saveLS('ws_sessions', cloudSessions);
+        if (!saveLS('ws_sessions', cloudSessions)) return { changed: false, added: 0, saveFailed: true };
         Sessions.invalidate();
         State.s.curSession = (cloud && cloud.cur) || cloudSessions[0].id;
         State.save();
-        return { changed: true, added: cloudSessions.length };
+        return { changed: true, added: cloudSessions.length, updated: 0 };
       }
       if (force) {
         // 手动「从云端恢复」：并集合并（同 id 取新），本地会话保留不丢
@@ -765,10 +769,10 @@ const Sync = (() => {
           if (!old || (s.ts || 0) > (old.ts || 0)) map.set(s.id, s);
         }
         const merged = Array.from(map.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 30);
-        saveLS('ws_sessions', merged);
+        if (!saveLS('ws_sessions', merged)) return { changed: false, added: 0, saveFailed: true };
         Sessions.invalidate();
         if (!State.s.curSession) { State.s.curSession = (merged[0] && merged[0].id) || ''; State.save(); }
-        return { changed: (added + updated) > 0, added };
+        return { changed: (added + updated) > 0, added, updated };
       }
       return NONE;   // 自动同步路径：本地有数据就不动（防覆盖）
     }
@@ -776,7 +780,7 @@ const Sync = (() => {
       const local = loadLS(LS.mem, { profile: '', ts: 0 });
       if ((cloud.ts || 0) >= (local.ts || 0)) {
         const ch = JSON.stringify(cloud) !== JSON.stringify(local);
-        if (ch) saveLS(LS.mem, cloud);
+        if (ch && !saveLS(LS.mem, cloud)) return { changed: false, added: 0, saveFailed: true };
         return { changed: ch, added: ch ? 1 : 0 };
       }
       return NONE;
@@ -784,12 +788,15 @@ const Sync = (() => {
     if (domain === 'rules') {
       const local = loadLS(LS.rules, []);
       const cloudArr = Array.isArray(cloud) ? cloud : [];
-      if (!local.length && cloudArr.length) { saveLS(LS.rules, cloudArr); return { changed: true, added: cloudArr.length }; }
+      if (!local.length && cloudArr.length) {
+        if (!saveLS(LS.rules, cloudArr)) return { changed: false, added: 0, saveFailed: true };
+        return { changed: true, added: cloudArr.length };
+      }
       if (force && cloudArr.length) {
         const seen = new Set(local.map(r => r && r.text));
         const fresh = cloudArr.filter(r => r && r.text && !seen.has(r.text));
         if (fresh.length) {
-          saveLS(LS.rules, local.concat(fresh).slice(0, 40));
+          if (!saveLS(LS.rules, local.concat(fresh).slice(0, 40))) return { changed: false, added: 0, saveFailed: true };
           return { changed: true, added: fresh.length };
         }
       }
@@ -808,28 +815,59 @@ const Sync = (() => {
     return NONE;
   }
 
-  /* 手动「从云端恢复」。返回 { classes, added, total, changed, topId }：
+  /* 手动「从云端恢复」。返回 { classes, added, total, changed, topId, src, loc, sameAsMine, saveFailed }：
      added 按域统计**真实新增**（会话数 / 知识库条数 / 法则条数 …），
-     界面据此说「新增 X 个对话、Y 条知识库」，而不是含混的「取回 N 类数据」。 */
+     src = 云端这个码里到底有什么、loc = 本机现在有什么 ——
+     界面据此把「账户为空」「数据早已在本机」「你填的是本机自己的码」三种情况分开说，
+     不再一律甩一句「没有可恢复的新数据」让用户猜。 */
   async function restore(code) {
     const target = (code || State.s.syncCode || '').toUpperCase();
-    if (!/^[A-Z2-7]{12}$/.test(target)) throw new Error('同步码格式不对（12 位）');
+    if (!/^[A-Z2-7]{12}$/.test(target)) {
+      const e = new Error('同步码必须是 12 位，且只含 A–Z 与 2–7（数字 0/1/8/9 不合法）');
+      e.code = 'BAD_CODE';
+      throw e;
+    }
     const j = await request('state.get', { domain: 'ALL', code: target });
     const added = { hist: 0, kb: 0, rules: 0, mem: 0, settings: 0 };
-    let classes = 0;
+    let classes = 0, saveFailed = false;
     for (const d of DOMAINS) {                 // 手动恢复：强制合并
       const r = merge(d, j[d], true);
+      if (r.saveFailed) saveFailed = true;
       if (r.changed) classes++;
       added[d] += r.added;
     }
     const total = added.hist + added.kb + added.rules;
-    /* 恢复后要让用户「看得见」：取并集里 ts 最新的会话，供界面切过去 */
+    /* 云端这个码里到底有多少东西 —— 用来区分「账户为空」和「数据早已在本机」 */
+    let cs = [];
+    if (j.hist && Array.isArray(j.hist.sessions)) cs = j.hist.sessions;
+    else if (Array.isArray(j.hist)) cs = [{ msgs: j.hist }];
+    const src = {
+      sess: cs.length,
+      msgs: cs.reduce((n, s) => n + ((s.msgs || []).length), 0),
+      kb: (j.kb || []).length,
+      rules: (Array.isArray(j.rules) ? j.rules : []).length,
+    };
+    /* 恢复后要让用户「看得见」：取并集里 ts 最新的会话；顺便记下本机现在有多少 */
+    const loc = { sess: 0, kb: 0, rules: 0, topTitle: '' };
     let topId = '';
     try {
-      const all = loadLS('ws_sessions', []);
-      if (all.length) topId = all.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0].id;
+      const all = Sessions.all();
+      loc.sess = all.length;
+      loc.kb = loadLS(LS.kb, []).length;
+      loc.rules = loadLS(LS.rules, []).length;
+      if (all.length) {
+        const top = all.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0];
+        topId = top.id;
+        loc.topTitle = top.title || '';
+      }
     } catch (e) { /* 读不到不影响恢复本身 */ }
-    return { classes, added, total, changed: total > 0 || classes > 0, topId };
+    return {
+      classes, added, total,
+      changed: (total > 0 || classes > 0) && !saveFailed,
+      saveFailed,
+      sameAsMine: target === String(State.s.syncCode || '').toUpperCase(),
+      topId, src, loc,
+    };
   }
 
   async function ensureCode() {
@@ -2022,6 +2060,16 @@ const Me = (() => {
 
   function openCodeModal() {
     $('#modal-code-input').value = '';
+    /* 必须把「本机当前是哪个码」摆出来：否则用户很容易把自己这个码填进去，
+       那等于「从自己恢复」——永远不会有新数据，却会被含混的提示误导成"同步坏了"。 */
+    const hint = $('#modal-code-hint');
+    if (hint) {
+      const mine = State.s.syncCode || '';
+      hint.innerHTML = mine
+        ? ('本机当前同步码：<b class="mono">' + mine + '</b>。这里要填的是<b>另一台设备/另一份备份</b>的码，'
+          + '填本机自己的码不会有新数据。')
+        : '本机还没生成同步码，填你要恢复的那台设备的码即可。';
+    }
     $('#modal-code').classList.remove('hidden');
     $('#modal-code-input').focus();
   }
@@ -2055,11 +2103,42 @@ const Me = (() => {
     $('#modal-code-ok').addEventListener('click', async () => {
       const want = $('#modal-code-input').value.trim().toUpperCase();
       const mine = State.s.syncCode;    // 本机当前身份。恢复过程绝不动它
+      /* 把自己这个码填进去 = 「从自己恢复」，永远不可能有新数据。
+         这是最容易踩的坑，必须当场拦住并把方向讲清楚，而不是回一句含混的失败提示。 */
+      if (want && mine && want === String(mine).toUpperCase()) {
+        toast('这就是本机当前的同步码（' + mine + '）。「从云端恢复」要填【另一台设备 / 另一份备份】的码；'
+          + '填本机自己的码不会有新数据。', 7000);
+        return;
+      }
+      /* 恢复后统一刷新（含会话列表）——否则数据已在库里、界面上却看不见 */
+      const refreshUI = () => {
+        renderCode(); fillSettings(); renderRules(); Chat.renderMsgs(); KB.render();
+        try { SessPanel.render(); } catch (e) { /* 历史面板从未渲染过时无所谓 */ }
+        const w = $('#chat-msgs'); if (w) w.scrollTop = w.scrollHeight;
+      };
       try {
         /* restore() 用的是参数里的码，不依赖 State.s.syncCode，所以这里无需先改身份 */
         const res = await Sync.restore(want);
+        if (res.saveFailed) {
+          toast('本机存储已满，恢复的数据没能写入。请先「我的 → 导出备份」，清理后再重试', 8000);
+          return;
+        }
         if (!res.changed) {
-          toast('这个同步码下没有可恢复的新数据（账户为空，或数据早已在本机）', 4500);
+          /* 「没有新增」有两种完全不同的原因，必须分开说：
+             ① 云端这个码是空的（抄错码 / 从未备份过）
+             ② 这份数据本机早就有了（之前恢复过） */
+          if ((res.src.sess + res.src.kb + res.src.rules) === 0) {
+            toast('同步码 ' + want + ' 在云端没有任何数据：该码可能从未备份过。请核对 12 位码有没有抄错。', 7000);
+          } else {
+            toast('该码的云端数据本机已全部拥有（云端 ' + res.src.sess + ' 个对话 / ' + res.src.kb
+              + ' 条知识库；本机 ' + res.loc.sess + ' 个对话 / ' + res.loc.kb + ' 条知识库），没有新增。'
+              + (res.topId ? ('已把界面切到最新的对话「' + (res.loc.topTitle || '') + '」。') : ''), 8500);
+          }
+          /* 关键：即使没有新增，也要刷列表 + 跳到最新对话 ——
+             否则「数据早就在本机」的人会一直停在旧对话上，以为还是没恢复。 */
+          if (res.topId) { State.s.curSession = res.topId; State.save(); }
+          $('#modal-code').classList.add('hidden');
+          refreshUI();
           return;
         }
         /* 本机已有身份就保持不变，只把数据并进来。
@@ -2083,11 +2162,14 @@ const Me = (() => {
           ? ('恢复完成：' + what + tail)
           : ('恢复完成：' + what + '；但回写云端失败：' + (Sync.lastError() || '未知错误')), 7000);
         $('#modal-code').classList.add('hidden');
-        renderCode(); fillSettings(); renderRules(); Chat.renderMsgs(); KB.render();
-        try { SessPanel.render(); } catch (e) { /* 历史面板从未渲染过时无所谓 */ }
-        const w = $('#chat-msgs'); if (w) w.scrollTop = w.scrollHeight;
+        refreshUI();
       } catch (e) {
-        toast('恢复失败：' + e.message);
+        const m = (e && e.code === 'NO_SUCH_CODE')
+          ? ('同步码 ' + want + ' 不存在（云端没有这个码）。请核对 12 位码有没有抄错')
+          : (e && e.code === 'BAD_CODE')
+            ? '同步码格式不对：必须是 12 位，且只含 A–Z 与 2–7（数字 0/1/8/9 不合法）'
+            : e.message;
+        toast('恢复失败：' + m, 7000);
       }
     });
     $('#me-model').addEventListener('change', (ev) => { State.s.model = ev.target.value; State.save(); Sync.markDirty('settings'); });
