@@ -355,15 +355,16 @@ const DOMAIN_CHAR_CAP = 240 * 1024;
 const DOMAIN_BYTE_CAP = 3 * 1024 * 1024;
 const DOMAIN_BYTE_CAP_SAFE = 96 * 1024;   // 比 102400 留 4KB 给信封，退回 json 也安全
 
-/* ---- B 项：hist 分片存储 ----
-   hist 会随对话增长顶爆单域上限（256K 字符）→ 超了就改为「按会话分片」：
-   清单 `hist` 只存 { sharded:true, ids:[...], cur }（几百字节），每个会话单独一片
-   `hist#<会话id>`。服务端 expandSharded() 读取时自动拼回 { sessions, cur }，
-   所以读取侧（merge/restore）一行都不用改，旧平铺数据也照常读。
-   平铺阈值取 180K 字符：能塞下就平铺（兼容 + 只发一个请求），塞不下才分片。 */
-const HIST_FLAT_CHAR_CAP = 180 * 1024;
-const HIST_FLAT_BYTE_CAP = 1.5 * 1024 * 1024;
-const SHARD_CHAR_CAP = 200 * 1024;        // 单会话分片上限（服务端单文件 256K 字符）
+/* ---- 分片存储（B 项）----
+   hist / kb 会随对话与知识库增长顶爆单域上限（256K 字符）→ 超了就改为「分片」：
+   清单只存 { sharded:true, ids:[...], kind, cur? }（几百字节），内容落到 `hist#<会话id>`
+   或 `kb#<片号>`。服务端 expandSharded() 读取时自动拼回原形状（hist → {sessions,cur}；
+   kb → 条目数组），所以读取侧（merge/restore）一行都不用改，旧平铺数据也照常读。
+   平铺阈值取 180K 字符：能塞下就平铺（兼容 + 只发一个请求），塞不下才分片
+   —— 这样**任何一条都不会再被丢弃**（旧实现是「装不下的旧条目直接不上云」）。 */
+const FLAT_CHAR_CAP = 180 * 1024;
+const FLAT_BYTE_CAP = 1.5 * 1024 * 1024;
+const SHARD_CHAR_CAP = 200 * 1024;        // 单分片上限（服务端单文件 256K 字符）
 const SHARD_BYTE_CAP = 1.5 * 1024 * 1024;
 
 /* UTF-8 字节数。TextEncoder 优先；老环境手算兜底（中文 3 字节、代理对 4 字节）。 */
@@ -576,7 +577,7 @@ const Sync = (() => {
       const cur = Sessions.curId();
 
       const flatS = JSON.stringify({ sessions: all, cur });
-      if (all.length && flatS.length <= HIST_FLAT_CHAR_CAP && utf8Len(flatS) <= HIST_FLAT_BYTE_CAP) {
+      if (all.length && flatS.length <= FLAT_CHAR_CAP && utf8Len(flatS) <= FLAT_BYTE_CAP) {
         return { mode: 'flat', data: { sessions: all, cur }, s: flatS, bytes: utf8Len(flatS), truncated: false, shards: [] };
       }
 
@@ -602,26 +603,39 @@ const Sync = (() => {
         if (trimmed) truncated = true;
         shards.push({ id: safeId(sess.id), data: sess, s: JSON.stringify(sess) });
       }
-      const manifest = { sharded: true, ids: shards.map((x) => x.id), cur };
+      const manifest = { sharded: true, kind: 'sessions', ids: shards.map((x) => x.id), cur };
       const ms = JSON.stringify(manifest);
       return { mode: 'sharded', data: manifest, s: ms, bytes: utf8Len(ms), truncated, shards };
     }
 
     if (domain === 'kb') {
-      /* 知识库按「新条目优先」装箱，同样守双预算。 */
+      /* 知识库同 hist 走双模：能平铺就平铺，超 180K 字符改为分片（每片尽量装多条，片号 k0/k1…）。
+         单条 kb 内容在 KB.add 处已限长（title≤60 / content≤1200），所以单片永远塞得下。 */
       const all = loadLS(LS.kb, []);
-      const out = [];
-      let chars = 2, bytes = 2;                            // "[]"
-      let truncated = false;
+      const flatS = JSON.stringify(all);
+      if (!all.length || (flatS.length <= FLAT_CHAR_CAP && utf8Len(flatS) <= FLAT_BYTE_CAP)) {
+        return { mode: 'flat', data: all, s: flatS, bytes: utf8Len(flatS), truncated: false, shards: [] };
+      }
+
+      const shards = [];
+      let bucket = [], bChars = 2, bBytes = 2, k = 0;
+      const flush = () => {
+        if (!bucket.length) return;
+        const payload = bucket;
+        shards.push({ id: 'k' + (k++), data: payload, s: JSON.stringify(payload) });
+        bucket = []; bChars = 2; bBytes = 2;
+      };
       for (const e of all) {
         const one = JSON.stringify(e);
-        const c = one.length + (out.length ? 1 : 0);
-        const b = utf8Len(one) + (out.length ? 1 : 0);
-        if (chars + c > maxChars || bytes + b > maxBytes) { truncated = true; break; }
-        out.push(e); chars += c; bytes += b;
+        const c = one.length + (bucket.length ? 1 : 0);
+        const b = utf8Len(one) + (bucket.length ? 1 : 0);
+        if (bucket.length && (bChars + c > SHARD_CHAR_CAP || bBytes + b > SHARD_BYTE_CAP)) flush();
+        bucket.push(e); bChars += c; bBytes += b;
       }
-      const s = JSON.stringify(out);
-      return { data: out, s, bytes: utf8Len(s), truncated };
+      flush();
+      const manifest = { sharded: true, kind: 'list', ids: shards.map((x) => x.id) };
+      const ms = JSON.stringify(manifest);
+      return { mode: 'sharded', data: manifest, s: ms, bytes: utf8Len(ms), truncated: false, shards };
     }
 
     /* 其余域（mem / settings）体量天然很小，不做裁剪 */
@@ -688,14 +702,15 @@ const Sync = (() => {
         try {
           let pack = snapshot(d);
           if (!force && hashes[d] === djb2(pack.s)) { dirty.delete(d); continue; }
-          /* B 项：hist 分片时，先逐片上传（跳过未变的），最后才写清单 ——
+          /* B 项：分片域（hist / kb）先逐片上传（跳过未变的），最后才写清单 ——
              顺序反过来会出现「清单已指向一个还没写上的片」。 */
-          if (d === 'hist' && pack.mode === 'sharded') {
+          if (pack.mode === 'sharded') {
             for (const sh of pack.shards) {
+              const key = d + '#' + sh.id;   // 带上域名：hist 与 kb 的片号不会互相覆盖
               const h = djb2(sh.s);
-              if (!force && shardHashes[sh.id] === h) continue;
-              await request('state.put', { domain: 'hist#' + sh.id, data: sh.data });
-              shardHashes[sh.id] = h;
+              if (!force && shardHashes[key] === h) continue;
+              await request('state.put', { domain: key, data: sh.data });
+              shardHashes[key] = h;
             }
           }
           try {
