@@ -711,19 +711,25 @@ const Sync = (() => {
   function setSyncState(txt) { lastState = txt; const el = $('#me-sync-state'); if (el) el.textContent = txt; }
   const lastError = () => lastErr;
 
-  /* 合并：知识库按 id 并集（同 id 取新），历史按 ts 去重排序，记忆取新，设置只取偏好 */
+  /* 合并：知识库按 id 并集（同 id 取新），历史按 ts 去重排序，记忆取新，设置只取偏好。
+     返回 { changed, added } —— changed = 本机数据是否真的被改动；added = 新增条目数。
+     为什么不再返回裸 boolean：恢复完成的提示原先说「取回 N 类数据」，而 settings 域原本恒为
+     true、kb 域也恒为 true，于是「4 类数据」可能对应「其实一条新数据都没有」，严重误导用户。 */
   function merge(domain, cloud, force) {
-    if (cloud == null) return false;
+    const NONE = { changed: false, added: 0 };
+    if (cloud == null) return NONE;
     if (domain === 'kb') {
       const local = loadLS(LS.kb, []);
       const map = new Map(local.map(e => [e.id, e]));
+      let added = 0;
       for (const e of (cloud || [])) {
         const old = map.get(e.id);
+        if (!old) added++;
         if (!old || (e.ts || 0) >= (old.ts || 0)) map.set(e.id, e);
       }
       const merged = Array.from(map.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 500);
       saveLS(LS.kb, merged);
-      return true;
+      return { changed: added > 0, added };
     }
     if (domain === 'hist') {
       /* 兼容两种云端格式：
@@ -739,65 +745,91 @@ const Sync = (() => {
           ts, msgs: cloud,
         }];
       }
-      if (!cloudSessions || !cloudSessions.length) return false;
+      if (!cloudSessions || !cloudSessions.length) return NONE;
       const local = loadLS('ws_sessions', []);
       if (!local.length) {
         saveLS('ws_sessions', cloudSessions);
         Sessions.invalidate();
         State.s.curSession = (cloud && cloud.cur) || cloudSessions[0].id;
         State.save();
-        return true;
+        return { changed: true, added: cloudSessions.length };
       }
       if (force) {
         // 手动「从云端恢复」：并集合并（同 id 取新），本地会话保留不丢
         const map = new Map(local.map(s => [s.id, s]));
+        let added = 0, updated = 0;
         for (const s of cloudSessions) {
           const old = map.get(s.id);
+          if (!old) added++;
+          else if ((s.ts || 0) > (old.ts || 0)) updated++;
           if (!old || (s.ts || 0) > (old.ts || 0)) map.set(s.id, s);
         }
         const merged = Array.from(map.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 30);
         saveLS('ws_sessions', merged);
         Sessions.invalidate();
         if (!State.s.curSession) { State.s.curSession = (merged[0] && merged[0].id) || ''; State.save(); }
-        return true;
+        return { changed: (added + updated) > 0, added };
       }
-      return false;   // 自动同步路径：本地有数据就不动（防覆盖）
+      return NONE;   // 自动同步路径：本地有数据就不动（防覆盖）
     }
     if (domain === 'mem') {
       const local = loadLS(LS.mem, { profile: '', ts: 0 });
-      if ((cloud.ts || 0) >= (local.ts || 0)) { saveLS(LS.mem, cloud); return true; }
-      return false;
+      if ((cloud.ts || 0) >= (local.ts || 0)) {
+        const ch = JSON.stringify(cloud) !== JSON.stringify(local);
+        if (ch) saveLS(LS.mem, cloud);
+        return { changed: ch, added: ch ? 1 : 0 };
+      }
+      return NONE;
     }
     if (domain === 'rules') {
       const local = loadLS(LS.rules, []);
       const cloudArr = Array.isArray(cloud) ? cloud : [];
-      if (!local.length && cloudArr.length) { saveLS(LS.rules, cloudArr); return true; }
+      if (!local.length && cloudArr.length) { saveLS(LS.rules, cloudArr); return { changed: true, added: cloudArr.length }; }
       if (force && cloudArr.length) {
         const seen = new Set(local.map(r => r && r.text));
-        const merged = local.concat(cloudArr.filter(r => r && r.text && !seen.has(r.text)));
-        saveLS(LS.rules, merged.slice(0, 40));
-        return true;
+        const fresh = cloudArr.filter(r => r && r.text && !seen.has(r.text));
+        if (fresh.length) {
+          saveLS(LS.rules, local.concat(fresh).slice(0, 40));
+          return { changed: true, added: fresh.length };
+        }
       }
-      return false;
+      return NONE;
     }
     if (domain === 'settings') {
-      if (cloud && cloud.model && !State.s.model) State.s.model = cloud.model;
-      if (typeof cloud.digestOn === 'boolean') State.s.digestOn = cloud.digestOn;
-      if (typeof cloud.kbOn === 'boolean') State.s.kbOn = cloud.kbOn;
-      if (typeof cloud.rememberOn === 'boolean') State.s.rememberOn = cloud.rememberOn;
-      State.save();
-      return true;
+      /* 注意：不要无条件返回 changed=true —— 那会让「恢复完成」虚报一类数据。 */
+      let ch = false;
+      if (cloud && cloud.model && !State.s.model) { State.s.model = cloud.model; ch = true; }
+      if (typeof cloud.digestOn === 'boolean' && State.s.digestOn !== cloud.digestOn) { State.s.digestOn = cloud.digestOn; ch = true; }
+      if (typeof cloud.kbOn === 'boolean' && State.s.kbOn !== cloud.kbOn) { State.s.kbOn = cloud.kbOn; ch = true; }
+      if (typeof cloud.rememberOn === 'boolean' && State.s.rememberOn !== cloud.rememberOn) { State.s.rememberOn = cloud.rememberOn; ch = true; }
+      if (ch) State.save();
+      return { changed: ch, added: 0 };
     }
-    return false;
+    return NONE;
   }
 
+  /* 手动「从云端恢复」。返回 { classes, added, total, changed, topId }：
+     added 按域统计**真实新增**（会话数 / 知识库条数 / 法则条数 …），
+     界面据此说「新增 X 个对话、Y 条知识库」，而不是含混的「取回 N 类数据」。 */
   async function restore(code) {
     const target = (code || State.s.syncCode || '').toUpperCase();
     if (!/^[A-Z2-7]{12}$/.test(target)) throw new Error('同步码格式不对（12 位）');
     const j = await request('state.get', { domain: 'ALL', code: target });
-    let n = 0;
-    for (const d of DOMAINS) if (merge(d, j[d], true)) n++;   // 手动恢复：强制合并
-    return n;
+    const added = { hist: 0, kb: 0, rules: 0, mem: 0, settings: 0 };
+    let classes = 0;
+    for (const d of DOMAINS) {                 // 手动恢复：强制合并
+      const r = merge(d, j[d], true);
+      if (r.changed) classes++;
+      added[d] += r.added;
+    }
+    const total = added.hist + added.kb + added.rules;
+    /* 恢复后要让用户「看得见」：取并集里 ts 最新的会话，供界面切过去 */
+    let topId = '';
+    try {
+      const all = loadLS('ws_sessions', []);
+      if (all.length) topId = all.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0].id;
+    } catch (e) { /* 读不到不影响恢复本身 */ }
+    return { classes, added, total, changed: total > 0 || classes > 0, topId };
   }
 
   async function ensureCode() {
@@ -826,7 +858,7 @@ const Sync = (() => {
       try {
         const j = await request('state.get', { domain: 'ALL' });
         let changed = false;
-        for (const d of DOMAINS) if (merge(d, j[d])) changed = true;
+        for (const d of DOMAINS) { if (merge(d, j[d]).changed) changed = true; }
         if (changed) { Chat.renderMsgs(); KB.render(); }
         /* 本地非空但云端更新（常见于重装/换设备）→ 不静默丢弃，提示可手动恢复 */
         if (!changed && j.hist && Array.isArray(j.hist.sessions)) {
@@ -2025,24 +2057,35 @@ const Me = (() => {
       const mine = State.s.syncCode;    // 本机当前身份。恢复过程绝不动它
       try {
         /* restore() 用的是参数里的码，不依赖 State.s.syncCode，所以这里无需先改身份 */
-        const n = await Sync.restore(want);
-        if (!n) {
-          toast('这个同步码下没有可恢复的数据（空账户或同步码不存在）', 4500);
+        const res = await Sync.restore(want);
+        if (!res.changed) {
+          toast('这个同步码下没有可恢复的新数据（账户为空，或数据早已在本机）', 4500);
           return;
         }
         /* 本机已有身份就保持不变，只把数据并进来。
            此前是直接把身份换成被恢复的码 —— 后果是「先设口令 → 后恢复」会让口令保护
            名存实亡：界面仍显示「已启用口令」，可码已经不是口令派生的了。 */
         if (!mine) State.s.syncCode = want;   // 只剩「本机还没拿到码」这一种情况才接管
+        /* 恢复进来的会话必须「看得见」：切到并集里最新的那个会话，
+           否则用户仍停在旧对话上，会以为「什么都没恢复」。 */
+        if (res.added.hist > 0 && res.topId) State.s.curSession = res.topId;
         State.save();                          // 立即落盘，避免被中途杀掉后回退，恢复白做
         /* 关键一步：把并集回写云端，让本地与云端收敛 ——
            这样旧数据才会真正进到本机（含口令派生的）同步码里。 */
         const okp = await Sync.pushAll(true);
+        const bits = [];
+        if (res.added.hist) bits.push(res.added.hist + ' 个对话');
+        if (res.added.kb) bits.push(res.added.kb + ' 条知识库');
+        if (res.added.rules) bits.push(res.added.rules + ' 条法则');
+        const what = bits.length ? ('新增 ' + bits.join('、')) : '偏好设置已对齐';
+        const tail = res.added.hist > 0 ? '；已切到最新恢复的对话' : '';
         toast(okp
-          ? ('恢复完成，共取回 ' + n + ' 类数据；同步码保持 ' + State.s.syncCode)
-          : ('恢复完成，数据已落在本机；但回写云端失败：' + (Sync.lastError() || '未知错误')), 7000);
+          ? ('恢复完成：' + what + tail)
+          : ('恢复完成：' + what + '；但回写云端失败：' + (Sync.lastError() || '未知错误')), 7000);
         $('#modal-code').classList.add('hidden');
-        renderCode(); fillSettings(); Chat.renderMsgs(); KB.render();
+        renderCode(); fillSettings(); renderRules(); Chat.renderMsgs(); KB.render();
+        try { SessPanel.render(); } catch (e) { /* 历史面板从未渲染过时无所谓 */ }
+        const w = $('#chat-msgs'); if (w) w.scrollTop = w.scrollHeight;
       } catch (e) {
         toast('恢复失败：' + e.message);
       }
