@@ -146,6 +146,7 @@ const LS = {
   seenVer: 'ws_seen_ver', api: 'ws_api', models: 'ws_models_cache',
   noStream: 'ws_nostream',   // 逃生开关：置 1 则永久退回非流式（不改代码即可回滚）
   nosum: 'ws_nosum',         // 逃生开关：置 1 则关闭 S3 滚动摘要（earlier 退回旧问题清单）
+  jsonBody: 'ws_jsonbody',   // 逃生开关：置 1 则请求体退回 application/json（备用）
 };
 function loadLS(key, dft) {
   try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? dft : v; }
@@ -343,9 +344,45 @@ function streamApiOf(base) {
 const DOMAINS = ['hist', 'mem', 'settings', 'rules', 'kb'];
 const PUSH_DELAY = 30 * 1000;
 
+/* ---- 单域请求体预算（两道上限都要守）----
+   ① 服务端自检 MAX_STATE_CHARS = 256K **字符**（wsapi/index.js）→ 超了回 TOO_BIG（可读）；
+   ② 网关请求体上限：**application/json 只有 100KB 字节**，text/plain 实测约 3MB。
+      超限由网关直接 413，**该响应不带 CORS 头** → 浏览器只能抛 TypeError
+      （WebKit 文案正是 "Load failed"）→ 前端会误报「网络不可用」。详见 2026-10-10 分析。
+   故取 240K 字符（给服务端留余量）+ 3MB 字节（正常永远触发不到，是防平台收回 text/plain 的兜底）。
+   SAFE 档用于「疑似撞了网关包体上限」时的自动重发。 */
+const DOMAIN_CHAR_CAP = 240 * 1024;
+const DOMAIN_BYTE_CAP = 3 * 1024 * 1024;
+const DOMAIN_BYTE_CAP_SAFE = 96 * 1024;   // 比 102400 留 4KB 给信封，退回 json 也安全
+
+/* UTF-8 字节数。TextEncoder 优先；老环境手算兜底（中文 3 字节、代理对 4 字节）。 */
+function utf8Len(s) {
+  if (typeof TextEncoder !== 'undefined') {
+    try { return new TextEncoder().encode(s).length; } catch (e) { /* 落到手算 */ }
+  }
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) { n += 4; i++; }
+    else n += 3;
+  }
+  return n;
+}
+
 const Sync = (() => {
   const api = () => (localStorage.getItem(LS.api) || API_DEFAULT).trim() || API_DEFAULT;
   const streamApi = () => streamApiOf(api());
+
+  /* 请求体 Content-Type（A 项修复）。
+     CloudBase 对事件型云函数的「文本类型请求体」硬上限是 **100KB**，而 application/json
+     被判为文本类型 → 备份包一超 100KB 就被网关 413 拦下；该 413 **不带 CORS 头**，
+     浏览器只能抛 TypeError（WebKit 文案正是 "Load failed"），前端因而误报「网络不可用」。
+     实测 text/plain 可到 ~3MB（约 30 倍余量），且它是 CORS 安全列表类型 → 连预检都不必发。
+     服务端 event.body + JSON.parse 原样可用，无需任何改动。
+     ws_jsonbody=1 可退回 application/json（不改代码的逃生开关）。 */
+  const CT = () => (loadLS(LS.jsonBody, false) ? 'application/json' : 'text/plain;charset=UTF-8');
 
   async function rawRequest(action, payload, timeoutMs, externalSignal) {
     const body = { action, code: State.s.syncCode || '', ...(payload || {}) };
@@ -361,7 +398,7 @@ const Sync = (() => {
     try {
       res = await fetch(api(), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': CT() },
         body: JSON.stringify(body),
         signal: ctl.signal,
       });
@@ -379,18 +416,31 @@ const Sync = (() => {
       clearTimeout(timer);
       if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
     }
+    /* 网关「请求体超限」的原文又长又是英文，翻成能照着行动的提示 */
+    const humanize = (msg) => {
+      const s = String(msg || '');
+      if (/EXCEED_MAX_PAYLOAD_SIZE|max payload size/i.test(s)) {
+        return '数据包超过云端网关上限（单次请求 100KB），本次已跳过';
+      }
+      return s;
+    };
     let j = null;
     try { j = await res.json(); }
     catch (e) {
-      const err = new Error('服务返回异常(' + res.status + ')');
+      const err = new Error(res.status === 413
+        ? '数据包超过云端网关上限（单次请求 100KB），本次已跳过'
+        : '服务返回异常(' + res.status + ')');
       err.network = res.status >= 500;
       err.status = res.status;
+      err.tooBig = res.status === 413;      // 备注：网关 413 通常不带 CORS 头，浏览器里到不了这一步
       throw err;
     }
     if (!j || j.ok !== true) {
-      const err = new Error((j && j.message) || ('HTTP ' + res.status));
+      const raw = (j && j.message) || ('HTTP ' + res.status);
+      const err = new Error(humanize(raw));
       err.code = j && j.error;
       err.status = res.status;
+      err.tooBig = res.status === 413 || err.code === 'TOO_BIG' || /payload size/i.test(raw);
       throw err;
     }
     return j;
@@ -497,35 +547,101 @@ const Sync = (() => {
     return { text, left, model, partial: !!evErr };
   }
 
-  /* 域数据快照 */
-  function snapshot(domain) {
-    if (domain === 'hist') return { sessions: loadLS('ws_sessions', []), cur: Sessions.curId() };
-    if (domain === 'kb') {
-      /* 服务端单域上限 256KB（MAX_STATE_CHARS），超限会整域备份失败。
-         故按「新条目优先」截断到 240KB 以内，宁可旧条目暂不上云，也不能整体备份挂掉。 */
-      const all = loadLS(LS.kb, []);
-      const CAP = 240 * 1024;
+  /* ---- 域数据快照（C 项：按预算装箱，超了如实告知）----
+     返回 { data, s, bytes, truncated }：
+       s = data 的 JSON 串（供 djb2 比对，避免重复 stringify）；
+       truncated = 本次为了塞进预算而少传了东西 —— 界面必须说出来，
+       否则用户会以为「备份是完整的」，那比报错更危险。 */
+  function snapshot(domain, opts) {
+    const o = opts || {};
+    const maxChars = o.maxChars || DOMAIN_CHAR_CAP;
+    const maxBytes = o.maxBytes || DOMAIN_BYTE_CAP;
+
+    if (domain === 'hist') {
+      /* 会话按「新→旧」装箱，装不下的旧会话**只留在本地**。
+         merge 是并集、导出备份也不受影响，所以「少传」不会删掉任何东西。 */
+      const all = loadLS('ws_sessions', []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      const cur = Sessions.curId();
+      const base = JSON.stringify({ sessions: [], cur });
+      let chars = base.length, bytes = utf8Len(base);
       const out = [];
-      let len = 2;
-      for (const e of all) {
-        const s = JSON.stringify(e).length;
-        if (len + s > CAP) break;
-        out.push(e); len += s + 1;
+      let truncated = false;
+      for (const sess of all) {
+        const one = JSON.stringify(sess);
+        const c = one.length + (out.length ? 1 : 0);      // 数组元素间的逗号
+        const b = utf8Len(one) + (out.length ? 1 : 0);
+        if (chars + c > maxChars || bytes + b > maxBytes) { truncated = true; break; }
+        out.push(sess); chars += c; bytes += b;
       }
-      return out;
+      /* 连最新一条都装不下（单会话体量过大）：只留它最近几条消息。
+         更早的内容本来就在 S3 滚动摘要里，不会全丢。 */
+      if (!out.length && all.length) {
+        const first = all[0];
+        const msgs = Array.isArray(first.msgs) ? first.msgs : [];
+        let keep = 0;
+        for (let n = msgs.length; n >= 1; n--) {
+          const t = JSON.stringify({ sessions: [{ ...first, msgs: msgs.slice(-n) }], cur });
+          if (t.length <= maxChars && utf8Len(t) <= maxBytes) { keep = n; break; }
+        }
+        out.push({ ...first, msgs: msgs.slice(-keep) });
+        truncated = true;
+      }
+      const data = { sessions: out, cur };
+      const s = JSON.stringify(data);
+      return { data, s, bytes: utf8Len(s), truncated };
     }
-    if (domain === 'mem') return loadLS(LS.mem, { profile: '', ts: 0 });
-    if (domain === 'rules') return loadLS(LS.rules, []);
+
+    if (domain === 'kb') {
+      /* 知识库按「新条目优先」装箱，同样守双预算。 */
+      const all = loadLS(LS.kb, []);
+      const out = [];
+      let chars = 2, bytes = 2;                            // "[]"
+      let truncated = false;
+      for (const e of all) {
+        const one = JSON.stringify(e);
+        const c = one.length + (out.length ? 1 : 0);
+        const b = utf8Len(one) + (out.length ? 1 : 0);
+        if (chars + c > maxChars || bytes + b > maxBytes) { truncated = true; break; }
+        out.push(e); chars += c; bytes += b;
+      }
+      const s = JSON.stringify(out);
+      return { data: out, s, bytes: utf8Len(s), truncated };
+    }
+
+    /* 其余域（mem / settings）体量天然很小，不做裁剪 */
+    if (domain === 'mem') {
+      const data = loadLS(LS.mem, { profile: '', ts: 0 });
+      const s = JSON.stringify(data);
+      return { data, s, bytes: utf8Len(s), truncated: false };
+    }
+    if (domain === 'rules') {
+      /* 法则同理按「新→旧」装箱；正常只有几十条，这里纯属防线 */
+      const all = loadLS(LS.rules, []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      const out = [];
+      let chars2 = 2, bytes2 = 2;
+      let cut = false;
+      for (const r of all) {
+        const one = JSON.stringify(r);
+        const c = one.length + (out.length ? 1 : 0);
+        const n = utf8Len(one) + (out.length ? 1 : 0);
+        if (chars2 + c > maxChars || bytes2 + n > maxBytes) { cut = true; break; }
+        out.push(r); chars2 += c; bytes2 += n;
+      }
+      const s = JSON.stringify(out);
+      return { data: out, s, bytes: utf8Len(s), truncated: cut };
+    }
     if (domain === 'settings') {
       const { model, digestOn, kbOn, rememberOn } = State.s;
-      return { model, digestOn, kbOn, rememberOn, ts: now() };
+      const data = { model, digestOn, kbOn, rememberOn, ts: now() };
+      const s = JSON.stringify(data);
+      return { data, s, bytes: utf8Len(s), truncated: false };
     }
-    return null;
+    return { data: null, s: 'null', bytes: 4, truncated: false };
   }
 
   const hashes = loadLS('ws_sync_hashes', {});
   const dirty = new Set();
-  let pushTimer = null, pushing = false, lastState = '';
+  let pushTimer = null, pushing = false, lastState = '', lastErr = '';
 
   function djb2(str) {
     let h = 5381;
@@ -544,26 +660,56 @@ const Sync = (() => {
     if (!State.s.syncOn || !State.s.syncCode) return false;
     if (pushing) return false;
     pushing = true;
+    const failed = [], trimmed = [];
+    let firstErr = '';
     try {
       for (const d of DOMAINS) {
         if (!force && !dirty.has(d)) continue;
-        const data = snapshot(d);
-        const h = djb2(JSON.stringify(data));
-        if (!force && hashes[d] === h) { dirty.delete(d); continue; }
-        await request('state.put', { domain: d, data });
-        hashes[d] = h;
-        dirty.delete(d);
+        /* C 项①：每个域**独立结算**。
+           原先任一域抛错就整个 catch 退出 —— 一个超限的 hist 会把
+           mem/settings/rules/kb 一起带下水（实测后果：界面 9 条法则，云端只有 1 条）。 */
+        try {
+          let pack = snapshot(d);
+          if (!force && hashes[d] === djb2(pack.s)) { dirty.delete(d); continue; }
+          try {
+            await request('state.put', { domain: d, data: pack.data });
+          } catch (e) {
+            /* C 项②：网关超限的 413 **不带 CORS 头**，前端只能看到 TypeError，
+               连错误码都拿不到 → 只能按「包体太大」猜一次，用保守档重裁重发。
+               猜错了（真网络抖动）也只是多试一次，无害。 */
+            /* 只在「包确实很大」时才猜：小包遇到网络错就是网络错，别拿裁剪去掩盖它，
+               否则真抖动会被记成一次"少传"，白白缩小云端备份。 */
+            if (!e.network || pack.bytes <= 100 * 1024) throw e;
+            const small = snapshot(d, { maxChars: DOMAIN_CHAR_CAP, maxBytes: DOMAIN_BYTE_CAP_SAFE });
+            if (small.bytes >= pack.bytes) throw e;   // 裁不小 → 不是包体问题，别瞎猜
+            await request('state.put', { domain: d, data: small.data });
+            pack = small;
+          }
+          hashes[d] = djb2(pack.s);
+          if (pack.truncated) trimmed.push(d);
+          dirty.delete(d);
+        } catch (e) {
+          failed.push(d);                              // 该域留着 dirty，下次重试
+          /* 带上域名：否则用户只看到一句「单域数据超上限」，不知道是哪个域、该去清哪里 */
+          if (!firstErr) firstErr = d + ' 域 ' + ((e && e.message) || '未知错误');
+        }
       }
       saveLS('ws_sync_hashes', hashes);
-      setSyncState('已备份 ' + new Date().toTimeString().slice(0, 5));
+      if (failed.length) {
+        lastErr = firstErr;
+        setSyncState('备份未完成：' + firstErr
+          + (failed.length > 1 ? ('（另有 ' + failed.slice(1).join('/') + ' 也失败）') : ''));
+        return false;
+      }
+      lastErr = '';
+      setSyncState('已备份 ' + new Date().toTimeString().slice(0, 5)
+        + (trimmed.length ? '（' + trimmed.join('/') + ' 只上传了最近部分）' : ''));
       return true;
-    } catch (e) {
-      setSyncState('备份失败：' + e.message);
-      return false;   // 返回值供调用方判断是否真的落库（口令启用等关键路径必须知道结果）
     } finally { pushing = false; }
   }
 
   function setSyncState(txt) { lastState = txt; const el = $('#me-sync-state'); if (el) el.textContent = txt; }
+  const lastError = () => lastErr;
 
   /* 合并：知识库按 id 并集（同 id 取新），历史按 ts 去重排序，记忆取新，设置只取偏好 */
   function merge(domain, cloud, force) {
@@ -688,7 +834,7 @@ const Sync = (() => {
           const localMax = loadLS('ws_sessions', []).reduce((m, s) => Math.max(m, s.ts || 0), 0);
           if (cloudMax > localMax + 60000) toast('云端有更新的对话，可在「我的 → 从云端恢复」拉取', 3500);
         }
-        for (const d of DOMAINS) { const h = djb2(JSON.stringify(snapshot(d))); hashes[d] = h; }
+        for (const d of DOMAINS) { hashes[d] = djb2(snapshot(d).s); }
         saveLS('ws_sync_hashes', hashes);
         setSyncState('已同步');
       } catch (e) { setSyncState('云同步失败：' + e.message); }
@@ -697,7 +843,7 @@ const Sync = (() => {
     }
   }
 
-  return { request, streamChat, markDirty, pushAll, restore, ensureCode, init, setSyncState };
+  return { request, streamChat, markDirty, pushAll, restore, ensureCode, init, setSyncState, lastError };
 })();
 
 /* ===== 口令式同步码 =====
@@ -827,8 +973,10 @@ const Safety = (() => {
   function afterOk(r, msg) {
     const n = (r && r.pulled) || 0;
     if (r && r.backed === false) {
-      /* 口令本身已生效，但云端没写上去 —— 必须说清楚，否则用户以为已经受保护了 */
-      toast(msg + '；但云端备份未成功，请联网后到「我的 → 立即备份」补一次', 7000);
+      /* 口令本身已生效，但云端没写上去 —— 必须说清楚，否则用户以为已经受保护了。
+         顺带带上真实原因：原先一律说"网络"，实测多数是包体超限，会把人带偏。 */
+      toast(msg + '；但云端备份未成功（' + (Sync.lastError() || '未知错误')
+        + '），请到「我的 → 立即备份」重试', 7500);
     } else {
       toast(n ? (msg + '，并从云端找回 ' + n + ' 类数据') : msg, 4000);
     }
@@ -1864,9 +2012,11 @@ const Me = (() => {
     });
     $('#me-backup').addEventListener('click', async () => {
       if (!State.s.syncCode) { await Sync.ensureCode(); }
-      if (!State.s.syncCode) { toast('网络不可用'); return; }
+      if (!State.s.syncCode) { toast('还没拿到同步码：连不上云端'); return; }
       toast('备份中…');
-      Sync.pushAll(true);
+      /* 必须等结果：备份到底成没成，用户有权知道（失败原因也不再只说"网络不可用"） */
+      const ok = await Sync.pushAll(true);
+      toast(ok ? '已备份到云端' : ('备份失败：' + (Sync.lastError() || '未知错误')), 6500);
     });
     $('#me-restore').addEventListener('click', () => openCodeModal());
     $('#modal-code-cancel').addEventListener('click', () => $('#modal-code').classList.add('hidden'));
@@ -1890,7 +2040,7 @@ const Me = (() => {
         const okp = await Sync.pushAll(true);
         toast(okp
           ? ('恢复完成，共取回 ' + n + ' 类数据；同步码保持 ' + State.s.syncCode)
-          : '恢复完成，但回写云端失败：请联网后点「立即备份」', 5500);
+          : ('恢复完成，数据已落在本机；但回写云端失败：' + (Sync.lastError() || '未知错误')), 7000);
         $('#modal-code').classList.add('hidden');
         renderCode(); fillSettings(); Chat.renderMsgs(); KB.render();
       } catch (e) {
