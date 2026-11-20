@@ -848,7 +848,11 @@ const Sync = (() => {
     if (domain === 'settings') {
       /* 注意：不要无条件返回 changed=true —— 那会让「恢复完成」虚报一类数据。 */
       let ch = false;
-      if (cloud && cloud.model && !State.s.model) { State.s.model = cloud.model; ch = true; }
+      /* 云端 settings 里可能存着已下线的模型名。若本地模型清单已知且不含它，
+         就不采用 —— 否则启动时会把旧模型「复活」回来，与 refreshModels 的迁移打架。 */
+      const known = loadLS(LS.models, []).map(m => m && m.id);
+      const cloudOk = cloud && cloud.model && (known.length ? known.indexOf(cloud.model) >= 0 : true);
+      if (cloudOk && !State.s.model) { State.s.model = cloud.model; ch = true; }
       if (typeof cloud.digestOn === 'boolean' && State.s.digestOn !== cloud.digestOn) { State.s.digestOn = cloud.digestOn; ch = true; }
       if (typeof cloud.kbOn === 'boolean' && State.s.kbOn !== cloud.kbOn) { State.s.kbOn = cloud.kbOn; ch = true; }
       if (typeof cloud.rememberOn === 'boolean' && State.s.rememberOn !== cloud.rememberOn) { State.s.rememberOn = cloud.rememberOn; ch = true; }
@@ -1949,7 +1953,12 @@ const Me = (() => {
       const list = (j.models || []).map(m => ({ id: m.id, label: m.label || m.id }));
       if (!list.length) throw new Error('模型列表为空');
       saveLS(LS.models, list);
-      if (!State.s.model && list[0]) { State.s.model = list[0].id; State.save(); }
+      /* 迁移：本地/云端存着的模型若已不在服务端清单里（例如整批下线换厂商），
+         必须切到清单首项。否则界面继续显示旧模型名，请求带过去被后端
+         modelAllowed 拦下、静默回落默认模型 —— 用户看到 A、实际跑 B。 */
+      const ids = list.map(m => m.id);
+      const cur = State.s.model;
+      if (list[0] && (!cur || ids.indexOf(cur) < 0)) { State.s.model = list[0].id; State.save(); }
       fillModelSelect();
       if (!silent) toast('已更新模型列表（' + list.length + ' 款）');
     } catch (e) {
